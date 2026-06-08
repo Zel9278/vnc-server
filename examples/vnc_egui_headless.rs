@@ -33,18 +33,18 @@ async fn run() -> io::Result<()> {
     let input = Arc::new(move |event: VncInputEvent| {
         let _ = tx.send(event);
     });
-    let mut config = VncServerConfig::new().with_input_callback(input);
+    let mut config = VncServerConfig::new()
+        .with_bind_addr(format!("127.0.0.1:{port}"))
+        .with_name("vnc-egui-headless")
+        .with_max_clients(4)
+        .with_input_callback(input);
     if let Some(password) = password {
         config = config.with_password(password);
         println!("VNC password authentication enabled");
     }
 
-    start_vnc_server(
-        format!("127.0.0.1:{port}"),
-        Arc::clone(&frame),
-        "vnc-egui-headless".to_string(),
-        config,
-    )?;
+    let server = start_vnc_server(Arc::clone(&frame), config)?;
+    server.set_clipboard_text("hello from headless egui");
     println!("Headless egui VNC demo listening on 127.0.0.1:{port}");
 
     let mut gpu = HeadlessGpu::new(WIDTH as u32, HEIGHT as u32).await?;

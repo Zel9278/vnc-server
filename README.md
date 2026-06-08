@@ -2,7 +2,7 @@
 
 Small standalone RFB/VNC server module.
 
-This crate streams top-down BGRA/BGRX frames through VNC and exposes optional input callbacks for keyboard, pointer, wheel, and clipboard events. It supports output-only mode, input callbacks, and standard VNC password authentication.
+This crate streams top-down BGRA/BGRX frames through VNC. It supports output-only mode, input callbacks, client connect/disconnect callbacks, max-client limits, bidirectional clipboard messages, standard VNC password authentication, Raw encoding, Hextile encoding, and tile-based damage tracking.
 
 ## Use
 
@@ -11,21 +11,39 @@ use std::sync::Arc;
 use vnc_server::{start_vnc_server, SharedFrame, VncServerConfig};
 
 let frame = SharedFrame::new(800, 480);
-start_vnc_server(
-    "127.0.0.1:5900".to_string(),
-    Arc::clone(&frame),
-    "example".to_string(),
-    VncServerConfig::default(),
-)?;
+let config = VncServerConfig::new()
+    .with_bind_addr("127.0.0.1:5900")
+    .with_name("example")
+    .with_max_clients(4);
+
+let server = start_vnc_server(Arc::clone(&frame), config)?;
 
 // Publish top-down BGRA/BGRX bytes, width * height * 4.
 frame.publish(&pixels);
+
+// Send clipboard text to connected clients.
+server.set_clipboard_text("hello from server");
+
+// Stop accepting clients and ask active client loops to exit.
+server.shutdown();
 # Ok::<(), std::io::Error>(())
 ```
 
-For input events, use `VncServerConfig::new().with_input_callback(callback)` and handle `VncInputEvent`.
+## Configuration
 
-For password authentication, use:
+Input events:
+
+```rust
+let config = VncServerConfig::new().with_input_callback(callback);
+```
+
+Client connect/disconnect/reject events:
+
+```rust
+let config = VncServerConfig::new().with_client_callback(callback);
+```
+
+Password authentication:
 
 ```rust
 let config = VncServerConfig::new().with_password("secret");
@@ -82,7 +100,6 @@ cargo run --example vnc_probe -- 5902 native secret
 - RFB 3.8 with compatibility for 3.7/3.3 clients.
 - No TLS; bind to `127.0.0.1` unless you add an access-control layer.
 - Raw and Hextile encodings.
-- Incremental requests use tracked dirty rectangles.
+- Incremental requests use tile-based dirty rectangles.
 - `VncInputEvent` includes helpers for pointer position, button masks, wheel deltas, and printable key text.
-
-
+- `VncServerHandle` exposes shutdown, active client count, local address, and server-to-client clipboard sending.

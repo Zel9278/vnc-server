@@ -1,13 +1,19 @@
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
-use std::net::{TcpListener, TcpStream};
-use std::sync::{Arc, Condvar, Mutex};
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::{
+    Arc, Condvar, Mutex,
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+};
 use std::thread;
+use std::time::Duration;
 
 use des::Des;
 use des::cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray};
 
 const DAMAGE_HISTORY_LIMIT: usize = 128;
+const DAMAGE_TILE_SIZE: usize = 32;
+const MAX_UPDATE_RECTS: usize = 1024;
 const ENCODING_RAW: i32 = 0;
 const ENCODING_HEXTILE: i32 = 5;
 const HEXTILE_RAW: u8 = 1;
@@ -51,31 +57,6 @@ impl Rect {
             width: x1 - x0,
             height: y1 - y0,
         })
-    }
-
-    fn union(self, other: Self) -> Self {
-        if self.is_empty() {
-            return other;
-        }
-        if other.is_empty() {
-            return self;
-        }
-        let x0 = self.x.min(other.x);
-        let y0 = self.y.min(other.y);
-        let x1 = self
-            .x
-            .saturating_add(self.width)
-            .max(other.x.saturating_add(other.width));
-        let y1 = self
-            .y
-            .saturating_add(self.height)
-            .max(other.y.saturating_add(other.height));
-        Self {
-            x: x0,
-            y: y0,
-            width: x1 - x0,
-            height: y1 - y0,
-        }
     }
 }
 
@@ -204,11 +185,33 @@ impl VncKey {
 }
 
 pub type VncInputCallback = Arc<dyn Fn(VncInputEvent) + Send + Sync + 'static>;
+pub type VncClientCallback = Arc<dyn Fn(VncClientEvent) + Send + Sync + 'static>;
 
-#[derive(Clone, Default)]
+#[derive(Clone, Debug)]
+pub enum VncClientEvent {
+    Connected {
+        id: u64,
+        peer: Option<SocketAddr>,
+    },
+    Disconnected {
+        id: u64,
+        peer: Option<SocketAddr>,
+        reason: Option<String>,
+    },
+    Rejected {
+        peer: Option<SocketAddr>,
+        reason: String,
+    },
+}
+
+#[derive(Clone)]
 pub struct VncServerConfig {
+    pub bind_addr: String,
+    pub name: String,
     pub input_callback: Option<VncInputCallback>,
+    pub client_callback: Option<VncClientCallback>,
     pub auth: VncAuth,
+    pub max_clients: Option<usize>,
 }
 
 impl VncServerConfig {
@@ -216,14 +219,47 @@ impl VncServerConfig {
         Self::default()
     }
 
+    pub fn with_bind_addr(mut self, bind_addr: impl Into<String>) -> Self {
+        self.bind_addr = bind_addr.into();
+        self
+    }
+
+    pub fn with_name(mut self, name: impl Into<String>) -> Self {
+        self.name = name.into();
+        self
+    }
+
     pub fn with_input_callback(mut self, callback: VncInputCallback) -> Self {
         self.input_callback = Some(callback);
+        self
+    }
+
+    pub fn with_client_callback(mut self, callback: VncClientCallback) -> Self {
+        self.client_callback = Some(callback);
         self
     }
 
     pub fn with_password(mut self, password: impl Into<String>) -> Self {
         self.auth = VncAuth::Password(password.into());
         self
+    }
+
+    pub fn with_max_clients(mut self, max_clients: usize) -> Self {
+        self.max_clients = Some(max_clients);
+        self
+    }
+}
+
+impl Default for VncServerConfig {
+    fn default() -> Self {
+        Self {
+            bind_addr: "127.0.0.1:5900".to_string(),
+            name: "vnc-server".to_string(),
+            input_callback: None,
+            client_callback: None,
+            auth: VncAuth::None,
+            max_clients: None,
+        }
     }
 }
 
@@ -252,6 +288,73 @@ impl VncAuth {
     }
 }
 
+#[derive(Clone)]
+pub struct VncServerHandle {
+    state: Arc<ServerState>,
+    local_addr: SocketAddr,
+}
+
+impl VncServerHandle {
+    pub fn shutdown(&self) {
+        self.state.shutdown.store(true, Ordering::Release);
+        self.state.clipboard.cond.notify_all();
+    }
+
+    pub fn is_shutdown(&self) -> bool {
+        self.state.shutdown.load(Ordering::Acquire)
+    }
+
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+
+    pub fn active_clients(&self) -> usize {
+        self.state.active_clients.load(Ordering::Acquire)
+    }
+
+    pub fn set_clipboard_text(&self, text: impl Into<Vec<u8>>) {
+        let mut inner = self.state.clipboard.inner.lock().unwrap();
+        inner.seq = inner.seq.wrapping_add(1);
+        inner.text = text.into();
+        drop(inner);
+        self.state.clipboard.cond.notify_all();
+    }
+}
+
+struct ServerState {
+    shutdown: AtomicBool,
+    active_clients: AtomicUsize,
+    next_client_id: AtomicU64,
+    clipboard: ServerClipboard,
+}
+
+impl ServerState {
+    fn new() -> Self {
+        Self {
+            shutdown: AtomicBool::new(false),
+            active_clients: AtomicUsize::new(0),
+            next_client_id: AtomicU64::new(1),
+            clipboard: ServerClipboard {
+                inner: Mutex::new(ClipboardInner {
+                    seq: 0,
+                    text: Vec::new(),
+                }),
+                cond: Condvar::new(),
+            },
+        }
+    }
+}
+
+struct ServerClipboard {
+    inner: Mutex<ClipboardInner>,
+    cond: Condvar,
+}
+
+struct ClipboardInner {
+    seq: u64,
+    text: Vec<u8>,
+}
+
 /// Latest rendered frame, shared between the render loop (producer) and any
 /// number of connected VNC clients (consumers). `data` is BGRX, width*height*4.
 pub struct SharedFrame {
@@ -267,10 +370,10 @@ struct FrameInner {
     damages: VecDeque<FrameDamage>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct FrameDamage {
     seq: u64,
-    rect: Option<Rect>,
+    rects: Vec<Rect>,
 }
 
 impl SharedFrame {
@@ -289,7 +392,7 @@ impl SharedFrame {
 
     pub fn publish(&self, frame: &[u8]) {
         let mut inner = self.inner.lock().unwrap();
-        let damage = compute_damage_rect(
+        let damage = compute_damage_rects(
             &inner.data,
             frame,
             inner.width as usize,
@@ -299,7 +402,7 @@ impl SharedFrame {
         inner.data.extend_from_slice(frame);
         inner.seq = inner.seq.wrapping_add(1);
         let seq = inner.seq;
-        inner.damages.push_back(FrameDamage { seq, rect: damage });
+        inner.damages.push_back(FrameDamage { seq, rects: damage });
         while inner.damages.len() > DAMAGE_HISTORY_LIMIT {
             inner.damages.pop_front();
         }
@@ -308,48 +411,97 @@ impl SharedFrame {
     }
 }
 
-/// Start a minimal RFB 3.8 (VNC) server on `addr`.
+/// Start a minimal RFB 3.8 (VNC) server.
 ///
-/// Each client is served Raw-encoded frames. Use [`VncServerConfig`] to enable
-/// input callbacks and optional VNC password authentication.
+/// Each client is served Raw-encoded frames. Use [`VncServerConfig`] to set the
+/// bind address, desktop name, callbacks, authentication, and client limit.
 ///
-/// Returns once the listener is bound; client handling happens on spawned
-/// threads.
+/// Returns once the listener is bound; client handling happens on background
+/// threads. Use the returned [`VncServerHandle`] to shut the server down or send
+/// clipboard text to clients.
 pub fn start_vnc_server(
-    addr: String,
     frame: Arc<SharedFrame>,
-    name: String,
     config: VncServerConfig,
-) -> io::Result<()> {
-    let listener = TcpListener::bind(&addr)?;
-    println!("VNC server listening on {addr}");
+) -> io::Result<VncServerHandle> {
+    let listener = TcpListener::bind(&config.bind_addr)?;
+    listener.set_nonblocking(true)?;
+    let local_addr = listener.local_addr()?;
+    println!("VNC server listening on {local_addr}");
+    let state = Arc::new(ServerState::new());
+    let handle = VncServerHandle {
+        state: Arc::clone(&state),
+        local_addr,
+    };
+    let listener_state = Arc::clone(&state);
     thread::Builder::new()
         .name("vnc-listener".to_string())
         .spawn(move || {
-            for stream in listener.incoming() {
-                match stream {
-                    Ok(stream) => {
-                        let peer = stream
-                            .peer_addr()
-                            .map(|a| a.to_string())
-                            .unwrap_or_else(|_| "?".to_string());
-                        println!("VNC client connected: {peer}");
+            while !listener_state.shutdown.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((stream, peer_addr)) => {
+                        let peer = Some(peer_addr);
+                        if let Some(max_clients) = config.max_clients {
+                            if listener_state.active_clients.load(Ordering::Acquire) >= max_clients
+                            {
+                                if let Some(cb) = &config.client_callback {
+                                    cb(VncClientEvent::Rejected {
+                                        peer,
+                                        reason: "client limit reached".to_string(),
+                                    });
+                                }
+                                drop(stream);
+                                continue;
+                            }
+                        }
+                        let peer = stream.peer_addr().ok().or(peer);
                         let frame = Arc::clone(&frame);
-                        let name = name.clone();
                         let config = config.clone();
+                        let client_state = Arc::clone(&listener_state);
+                        let client_id = client_state.next_client_id.fetch_add(1, Ordering::AcqRel);
+                        client_state.active_clients.fetch_add(1, Ordering::AcqRel);
+                        if let Some(cb) = &config.client_callback {
+                            cb(VncClientEvent::Connected {
+                                id: client_id,
+                                peer,
+                            });
+                        }
                         thread::spawn(move || {
-                            if let Err(e) = handle_vnc_client(stream, frame, name, config) {
-                                println!("VNC client {peer} disconnected: {e}");
+                            let result = handle_vnc_client(
+                                stream,
+                                frame,
+                                config.name.clone(),
+                                config.clone(),
+                                Arc::clone(&client_state),
+                            );
+                            client_state.active_clients.fetch_sub(1, Ordering::AcqRel);
+                            let reason = result.as_ref().err().map(|e| e.to_string());
+                            if let Some(cb) = &config.client_callback {
+                                cb(VncClientEvent::Disconnected {
+                                    id: client_id,
+                                    peer,
+                                    reason: reason.clone(),
+                                });
+                            }
+                            if let Err(e) = result {
+                                println!("VNC client {peer:?} disconnected: {e}");
                             } else {
-                                println!("VNC client {peer} disconnected");
+                                println!("VNC client {peer:?} disconnected");
                             }
                         });
                     }
-                    Err(e) => eprintln!("VNC accept error: {e}"),
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(e) => {
+                        if !listener_state.shutdown.load(Ordering::Acquire) {
+                            eprintln!("VNC accept error: {e}");
+                        }
+                        thread::sleep(Duration::from_millis(50));
+                    }
                 }
             }
         })?;
-    Ok(())
+    Ok(handle)
 }
 
 fn run_vnc_password_auth(
@@ -539,6 +691,7 @@ fn handle_vnc_client(
     frame: Arc<SharedFrame>,
     name: String,
     config: VncServerConfig,
+    server_state: Arc<ServerState>,
 ) -> io::Result<()> {
     stream.set_nodelay(true).ok();
 
@@ -609,10 +762,13 @@ fn handle_vnc_client(
         let pixel_format = Arc::clone(&pixel_format);
         let encoding = Arc::clone(&encoding);
         let input_callback = input_callback.clone();
+        let reader_state = Arc::clone(&server_state);
         let mut reader = stream.try_clone()?;
         thread::spawn(move || {
             let mut msg = [0u8; 1];
-            while reader.read_exact(&mut msg).is_ok() {
+            while !reader_state.shutdown.load(Ordering::Acquire)
+                && reader.read_exact(&mut msg).is_ok()
+            {
                 let ok = match msg[0] {
                     0 => {
                         let mut body = [0u8; 19];
@@ -747,15 +903,32 @@ fn handle_vnc_client(
     }
 
     let mut last_seq = 0u64;
+    let mut last_clipboard_seq = 0u64;
     let mut encoded: Vec<u8> = Vec::new();
-    loop {
-        let request = {
+    while !server_state.shutdown.load(Ordering::Acquire) {
+        if let Some(text) = clipboard_since(&server_state, last_clipboard_seq) {
+            last_clipboard_seq = text.0;
+            write_server_cut_text(&mut stream, &text.1)?;
+        }
+
+        let Some(request) = ({
             let (lock, cond) = &*client_request;
             let mut request = lock.lock().unwrap();
-            while request.is_none() {
-                request = cond.wait(request).unwrap();
+            while request.is_none() && !server_state.shutdown.load(Ordering::Acquire) {
+                let (next, _) = cond
+                    .wait_timeout(request, Duration::from_millis(50))
+                    .unwrap();
+                request = next;
+                if let Some(text) = clipboard_since(&server_state, last_clipboard_seq) {
+                    last_clipboard_seq = text.0;
+                    drop(request);
+                    write_server_cut_text(&mut stream, &text.1)?;
+                    request = lock.lock().unwrap();
+                }
             }
-            request.take().unwrap()
+            request.take()
+        }) else {
+            continue;
         };
 
         let request_rect = request.rect.intersect(Rect::full(width, height));
@@ -763,37 +936,59 @@ fn handle_vnc_client(
             write_empty_update(&mut stream)?;
             continue;
         };
-        let (raw, rect) = loop {
+        let (raw, rects) = loop {
             let mut inner = frame.inner.lock().unwrap();
-            let rect = if request.incremental {
-                while damage_since(&inner, last_seq).is_none() {
-                    inner = frame.cond.wait(inner).unwrap();
+            let rects = if request.incremental {
+                while damage_since(&inner, last_seq).is_none()
+                    && !server_state.shutdown.load(Ordering::Acquire)
+                {
+                    let (next, _) = frame
+                        .cond
+                        .wait_timeout(inner, Duration::from_millis(50))
+                        .unwrap();
+                    inner = next;
                 }
-                damage_since(&inner, last_seq)
-                    .flatten()
-                    .and_then(|r| r.intersect(request_rect))
+                damage_since(&inner, last_seq).map(|rects| {
+                    rects
+                        .into_iter()
+                        .filter_map(|r| r.intersect(request_rect))
+                        .collect::<Vec<_>>()
+                })
             } else {
-                Some(request_rect)
+                Some(vec![request_rect])
             };
             last_seq = inner.seq;
-            if let Some(rect) = rect {
-                break (inner.data.clone(), rect);
+            if let Some(rects) = rects {
+                if !rects.is_empty() {
+                    break (inner.data.clone(), coalesce_rects(rects, width, height));
+                }
             }
-            while inner.seq == last_seq {
-                inner = frame.cond.wait(inner).unwrap();
+            if server_state.shutdown.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            while inner.seq == last_seq && !server_state.shutdown.load(Ordering::Acquire) {
+                let (next, _) = frame
+                    .cond
+                    .wait_timeout(inner, Duration::from_millis(50))
+                    .unwrap();
+                inner = next;
             }
         };
         let fmt = *pixel_format.lock().unwrap();
         let encoding = *encoding.lock().unwrap();
-        match encoding {
-            VncEncoding::Raw => encode_rect(&raw, width as usize, rect, &fmt, &mut encoded),
-            VncEncoding::Hextile => {
-                encode_hextile_rect(&raw, width as usize, rect, &fmt, &mut encoded)
+        write_update_start(&mut stream, rects.len())?;
+        for rect in rects {
+            match encoding {
+                VncEncoding::Raw => encode_rect(&raw, width as usize, rect, &fmt, &mut encoded),
+                VncEncoding::Hextile => {
+                    encode_hextile_rect(&raw, width as usize, rect, &fmt, &mut encoded)
+                }
             }
+            write_rect_header(&mut stream, rect, encoding)?;
+            stream.write_all(&encoded)?;
         }
-        write_update_header(&mut stream, rect, encoding)?;
-        stream.write_all(&encoded)?;
     }
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -802,13 +997,12 @@ struct UpdateRequest {
     rect: Rect,
 }
 
-fn write_update_header(
-    stream: &mut TcpStream,
-    rect: Rect,
-    encoding: VncEncoding,
-) -> io::Result<()> {
+fn write_update_start(stream: &mut TcpStream, rect_count: usize) -> io::Result<()> {
     stream.write_all(&[0u8, 0u8])?;
-    stream.write_all(&1u16.to_be_bytes())?;
+    stream.write_all(&(rect_count as u16).to_be_bytes())
+}
+
+fn write_rect_header(stream: &mut TcpStream, rect: Rect, encoding: VncEncoding) -> io::Result<()> {
     stream.write_all(&rect.x.to_be_bytes())?;
     stream.write_all(&rect.y.to_be_bytes())?;
     stream.write_all(&rect.width.to_be_bytes())?;
@@ -821,76 +1015,76 @@ fn write_empty_update(stream: &mut TcpStream) -> io::Result<()> {
     stream.write_all(&0u16.to_be_bytes())
 }
 
-fn damage_since(inner: &FrameInner, last_seq: u64) -> Option<Option<Rect>> {
+fn write_server_cut_text(stream: &mut TcpStream, text: &[u8]) -> io::Result<()> {
+    stream.write_all(&[3u8, 0, 0, 0])?;
+    stream.write_all(&(text.len() as u32).to_be_bytes())?;
+    stream.write_all(text)
+}
+
+fn clipboard_since(state: &ServerState, last_seq: u64) -> Option<(u64, Vec<u8>)> {
+    let inner = state.clipboard.inner.lock().unwrap();
+    (inner.seq != 0 && inner.seq > last_seq).then(|| (inner.seq, inner.text.clone()))
+}
+
+fn damage_since(inner: &FrameInner, last_seq: u64) -> Option<Vec<Rect>> {
     if inner.seq <= last_seq {
-        return Some(None);
+        return Some(Vec::new());
     }
     let first_seq = inner.damages.front().map(|d| d.seq)?;
     if last_seq < first_seq.saturating_sub(1) {
-        return Some(Some(Rect::full(inner.width, inner.height)));
+        return Some(vec![Rect::full(inner.width, inner.height)]);
     }
-    let mut damage = None;
+    let mut damage = Vec::new();
     for entry in inner.damages.iter().filter(|entry| entry.seq > last_seq) {
-        if let Some(rect) = entry.rect {
-            damage = Some(damage.map_or(rect, |acc: Rect| acc.union(rect)));
-        }
+        damage.extend_from_slice(&entry.rects);
     }
     Some(damage)
 }
 
-fn compute_damage_rect(old: &[u8], new: &[u8], width: usize, height: usize) -> Option<Rect> {
+fn coalesce_rects(mut rects: Vec<Rect>, width: u16, height: u16) -> Vec<Rect> {
+    rects.retain(|r| !r.is_empty());
+    if rects.is_empty() {
+        return rects;
+    }
+    if rects.len() > MAX_UPDATE_RECTS {
+        return vec![Rect::full(width, height)];
+    }
+    rects
+}
+
+fn compute_damage_rects(old: &[u8], new: &[u8], width: usize, height: usize) -> Vec<Rect> {
     if width == 0 || height == 0 {
-        return None;
+        return Vec::new();
     }
     if old.len() != new.len() || new.len() != width * height * 4 {
-        return Some(Rect::full(width as u16, height as u16));
+        return vec![Rect::full(width as u16, height as u16)];
     }
 
-    let mut min_x = width;
-    let mut min_y = height;
-    let mut max_x = 0usize;
-    let mut max_y = 0usize;
-    let mut changed = false;
-    for y in 0..height {
-        let row_start = y * width * 4;
-        let old_row = &old[row_start..row_start + width * 4];
-        let new_row = &new[row_start..row_start + width * 4];
-        if old_row == new_row {
-            continue;
-        }
-        let mut row_min = 0usize;
-        while row_min < width {
-            let i = row_min * 4;
-            if old_row[i..i + 4] != new_row[i..i + 4] {
-                break;
+    let mut rects = Vec::new();
+    for tile_y in (0..height).step_by(DAMAGE_TILE_SIZE) {
+        for tile_x in (0..width).step_by(DAMAGE_TILE_SIZE) {
+            let tile_w = (width - tile_x).min(DAMAGE_TILE_SIZE);
+            let tile_h = (height - tile_y).min(DAMAGE_TILE_SIZE);
+            let mut changed = false;
+            'rows: for row in tile_y..tile_y + tile_h {
+                let start = (row * width + tile_x) * 4;
+                let end = start + tile_w * 4;
+                if old[start..end] != new[start..end] {
+                    changed = true;
+                    break 'rows;
+                }
             }
-            row_min += 1;
-        }
-        let mut row_max = width - 1;
-        while row_max > row_min {
-            let i = row_max * 4;
-            if old_row[i..i + 4] != new_row[i..i + 4] {
-                break;
+            if changed {
+                rects.push(Rect {
+                    x: tile_x as u16,
+                    y: tile_y as u16,
+                    width: tile_w as u16,
+                    height: tile_h as u16,
+                });
             }
-            row_max -= 1;
         }
-        changed = true;
-        min_x = min_x.min(row_min);
-        min_y = min_y.min(y);
-        max_x = max_x.max(row_max);
-        max_y = max_y.max(y);
     }
-
-    if changed {
-        Some(Rect {
-            x: min_x as u16,
-            y: min_y as u16,
-            width: (max_x - min_x + 1) as u16,
-            height: (max_y - min_y + 1) as u16,
-        })
-    } else {
-        None
-    }
+    rects
 }
 
 #[cfg(test)]
@@ -900,36 +1094,44 @@ mod tests {
     #[test]
     fn damage_rect_is_none_for_identical_frames() {
         let frame = vec![0u8; 4 * 3 * 4];
-        assert_eq!(compute_damage_rect(&frame, &frame, 4, 3), None);
+        assert_eq!(compute_damage_rects(&frame, &frame, 4, 3), Vec::new());
     }
 
     #[test]
-    fn damage_rect_bounds_changed_pixels() {
-        let old = vec![0u8; 4 * 3 * 4];
+    fn damage_rects_track_changed_tiles() {
+        let old = vec![0u8; 64 * 64 * 4];
         let mut new = old.clone();
-        new[(1 * 4 + 2) * 4] = 1;
-        new[(2 * 4 + 3) * 4] = 1;
+        new[(1 * 64 + 2) * 4] = 1;
+        new[(40 * 64 + 40) * 4] = 1;
         assert_eq!(
-            compute_damage_rect(&old, &new, 4, 3),
-            Some(Rect {
-                x: 2,
-                y: 1,
-                width: 2,
-                height: 2,
-            })
+            compute_damage_rects(&old, &new, 64, 64),
+            vec![
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 32,
+                    height: 32,
+                },
+                Rect {
+                    x: 32,
+                    y: 32,
+                    width: 32,
+                    height: 32,
+                }
+            ]
         );
     }
 
     #[test]
     fn damage_rect_is_full_for_size_mismatch() {
         assert_eq!(
-            compute_damage_rect(&[0; 4], &[0; 8], 2, 1),
-            Some(Rect {
+            compute_damage_rects(&[0; 4], &[0; 8], 2, 1),
+            vec![Rect {
                 x: 0,
                 y: 0,
                 width: 2,
                 height: 1,
-            })
+            }]
         );
     }
 

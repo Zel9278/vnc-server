@@ -13,7 +13,9 @@ use std::io;
 use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
-use vnc_server::{SharedFrame, VncInputEvent, VncMouseButton, VncServerConfig, start_vnc_server};
+use vnc_server::{
+    SharedFrame, VncClientEvent, VncInputEvent, VncMouseButton, VncServerConfig, start_vnc_server,
+};
 
 const WIDTH: u16 = 800;
 const HEIGHT: u16 = 480;
@@ -67,19 +69,23 @@ fn main() -> io::Result<()> {
     let input = Arc::new(move |event: VncInputEvent| {
         let _ = tx.send(event);
     });
+    let client_events = Arc::new(move |event: VncClientEvent| {
+        println!("client event: {event:?}");
+    });
 
-    let mut config = VncServerConfig::new().with_input_callback(input);
+    let mut config = VncServerConfig::new()
+        .with_bind_addr(format!("127.0.0.1:{port}"))
+        .with_name("vnc-input-demo")
+        .with_max_clients(4)
+        .with_client_callback(client_events)
+        .with_input_callback(input);
     if let Some(password) = password {
         config = config.with_password(password);
         println!("VNC password authentication enabled");
     }
 
-    start_vnc_server(
-        format!("127.0.0.1:{port}"),
-        Arc::clone(&frame),
-        "vnc-input-demo".to_string(),
-        config,
-    )?;
+    let server = start_vnc_server(Arc::clone(&frame), config)?;
+    server.set_clipboard_text("hello from vnc-server");
 
     println!("VNC input demo listening on 127.0.0.1:{port}");
     println!("Move the pointer, click, type keys, or paste clipboard text in your VNC client.");
