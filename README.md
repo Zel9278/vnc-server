@@ -52,13 +52,59 @@ Input events:
 
 ```rust
 use std::sync::Arc;
-use vnc_server::{VncInputEvent, VncServerConfig};
+use vnc_server::{VncInputEvent, VncMouseButton, VncServerConfig};
 
 let callback = Arc::new(|event: VncInputEvent| {
-    println!("input: {event:?}");
+    match event {
+        VncInputEvent::Pointer {
+            client_id,
+            button_mask,
+            x,
+            y,
+            ..
+        } => {
+            let left = (button_mask & VncMouseButton::Left.mask()) != 0;
+            println!("client #{client_id} pointer {x},{y} left={left}");
+        }
+        VncInputEvent::Key {
+            client_id,
+            down,
+            key,
+            ..
+        } => {
+            println!("client #{client_id} key {key:#x} down={down}");
+        }
+        VncInputEvent::ClientCutText {
+            client_id, text, ..
+        } => {
+            println!("client #{client_id} clipboard {} bytes", text.len());
+        }
+    }
 });
 
 let config = VncServerConfig::new().with_input_callback(callback);
+```
+
+Each input event includes `client_id` and `peer`, so a server can maintain separate state per connected VNC client.
+
+Current client cursors:
+
+```rust,no_run
+# use std::sync::Arc;
+# use vnc_server::{start_vnc_server, SharedFrame, VncServerConfig};
+# fn main() -> std::io::Result<()> {
+# let frame = SharedFrame::new(800, 480);
+# let server = start_vnc_server(Arc::clone(&frame), VncServerConfig::new())?;
+for cursor in server.client_cursors() {
+    if cursor.position_known {
+        println!(
+            "client #{} at {},{} buttons=0b{:08b}",
+            cursor.client_id, cursor.x, cursor.y, cursor.button_mask
+        );
+    }
+}
+# Ok(())
+# }
 ```
 
 Client connect/disconnect/reject events:
@@ -97,6 +143,14 @@ Input/click/keyboard demo:
 ```powershell
 cargo run --example vnc_input_demo -- --host 127.0.0.1 --port 5902
 ```
+
+Multi-cursor and multi-keyboard test server:
+
+```powershell
+cargo run --example vnc_multi_input_demo -- --host 127.0.0.1 --port 5904
+```
+
+Connect two or more VNC clients to port `5904`. Each client has an independent cursor color, button state, and typed text buffer.
 
 Listen on every network interface with password auth:
 
@@ -146,8 +200,8 @@ cargo run --example vnc_egui_headless -- --help
 - No TLS; bind to `127.0.0.1` unless you add an access-control layer.
 - Raw and Hextile encodings.
 - Incremental requests use tile-based dirty rectangles.
-- `VncInputEvent` includes helpers for pointer position, button masks, wheel deltas, and printable key text.
-- `VncServerHandle` exposes shutdown, active client count, local address, and server-to-client clipboard sending.
+- `VncInputEvent` includes client IDs, peer addresses, and helpers for pointer position, button masks, wheel deltas, and printable key text.
+- `VncServerHandle` exposes shutdown, active client count, local address, per-client cursors, and server-to-client clipboard sending.
 
 ## Validation
 

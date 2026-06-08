@@ -5,12 +5,15 @@
 //
 // Then connect a VNC client to 127.0.0.1:<port>.
 
+use std::collections::HashMap;
 use std::env;
 use std::io;
 use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
-use vnc_server::{SharedFrame, VncInputEvent, VncMouseButton, VncServerConfig, start_vnc_server};
+use vnc_server::{
+    SharedFrame, VncCursor, VncInputEvent, VncMouseButton, VncServerConfig, start_vnc_server,
+};
 
 const WIDTH: u16 = 960;
 const HEIGHT: u16 = 600;
@@ -76,7 +79,8 @@ async fn run() -> io::Result<()> {
         };
 
         let ctx_for_ui = ctx.clone();
-        let full_output = ctx.run_ui(raw_input, |_| app.ui(&ctx_for_ui, &input_state));
+        let cursors = server.client_cursors();
+        let full_output = ctx.run_ui(raw_input, |_| app.ui(&ctx_for_ui, &input_state, &cursors));
         gpu.render_egui(&ctx, full_output, &mut pixels)?;
         frame.publish(&pixels);
         thread::sleep(Duration::from_millis(33));
@@ -169,7 +173,7 @@ struct DemoApp {
 }
 
 impl DemoApp {
-    fn ui(&mut self, ctx: &egui::Context, input: &InputState) {
+    fn ui(&mut self, ctx: &egui::Context, input: &InputState, cursors: &[VncCursor]) {
         egui::Area::new(egui::Id::new("root"))
             .fixed_pos(egui::pos2(0.0, 0.0))
             .show(ctx, |ui| {
@@ -187,6 +191,14 @@ impl DemoApp {
                                 "pointer: {:.0}, {:.0}",
                                 input.pointer_pos.x, input.pointer_pos.y
                             ));
+                            ui.label(format!(
+                                "active client: {}",
+                                input
+                                    .active_client_id
+                                    .map(|id| format!("#{id}"))
+                                    .unwrap_or_else(|| "-".to_string())
+                            ));
+                            ui.label(format!("clients: {}", cursors.len()));
                             ui.label(format!("buttons: 0b{:08b}", input.button_mask));
                             ui.label(format!("wheel: {}", input.wheel_ticks));
                         });
@@ -215,13 +227,40 @@ impl DemoApp {
                             });
                     });
             });
+
+        let painter = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("vnc-client-cursors"),
+        ));
+        for cursor in cursors.iter().filter(|cursor| cursor.position_known) {
+            let pos = egui::pos2(cursor.x as f32, cursor.y as f32);
+            let color = cursor_color(cursor.client_id);
+            painter.line_segment(
+                [pos + egui::vec2(-14.0, 0.0), pos + egui::vec2(14.0, 0.0)],
+                egui::Stroke::new(2.0, color),
+            );
+            painter.line_segment(
+                [pos + egui::vec2(0.0, -14.0), pos + egui::vec2(0.0, 14.0)],
+                egui::Stroke::new(2.0, color),
+            );
+            painter.circle_stroke(pos, 8.0, egui::Stroke::new(2.0, color));
+            painter.text(
+                pos + egui::vec2(12.0, 10.0),
+                egui::Align2::LEFT_TOP,
+                format!("C{}", cursor.client_id),
+                egui::FontId::monospace(13.0),
+                color,
+            );
+        }
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct InputState {
     pointer_pos: egui::Pos2,
     button_mask: u8,
+    active_client_id: Option<u64>,
+    client_button_masks: HashMap<u64, u8>,
     modifiers: egui::Modifiers,
     wheel_ticks: i64,
 }
@@ -231,6 +270,8 @@ impl Default for InputState {
         Self {
             pointer_pos: egui::pos2(WIDTH as f32 * 0.5, HEIGHT as f32 * 0.5),
             button_mask: 0,
+            active_client_id: None,
+            client_button_masks: HashMap::new(),
             modifiers: egui::Modifiers::default(),
             wheel_ticks: 0,
         }
@@ -240,16 +281,28 @@ impl Default for InputState {
 impl InputState {
     fn apply_vnc_event(&mut self, event: VncInputEvent, out: &mut Vec<egui::Event>) {
         match event {
-            VncInputEvent::Pointer { button_mask, x, y } => {
+            event @ VncInputEvent::Pointer {
+                client_id,
+                button_mask,
+                x,
+                y,
+                ..
+            } => {
+                self.active_client_id = Some(client_id);
                 self.pointer_pos = egui::pos2(x as f32, y as f32);
                 out.push(egui::Event::PointerMoved(self.pointer_pos));
+                let previous_mask = self
+                    .client_button_masks
+                    .get(&client_id)
+                    .copied()
+                    .unwrap_or(0);
 
                 for (vnc_button, egui_button) in [
                     (VncMouseButton::Left, egui::PointerButton::Primary),
                     (VncMouseButton::Middle, egui::PointerButton::Middle),
                     (VncMouseButton::Right, egui::PointerButton::Secondary),
                 ] {
-                    let was = (self.button_mask & vnc_button.mask()) != 0;
+                    let was = (previous_mask & vnc_button.mask()) != 0;
                     let now = (button_mask & vnc_button.mask()) != 0;
                     if was != now {
                         out.push(egui::Event::PointerButton {
@@ -261,8 +314,7 @@ impl InputState {
                     }
                 }
 
-                let wheel =
-                    VncInputEvent::Pointer { button_mask, x, y }.wheel_delta(self.button_mask);
+                let wheel = event.wheel_delta(previous_mask);
                 if wheel != 0 {
                     let delta = 72.0 * wheel as f32;
                     self.wheel_ticks += wheel as i64;
@@ -274,8 +326,15 @@ impl InputState {
                     });
                 }
                 self.button_mask = button_mask;
+                self.client_button_masks.insert(client_id, button_mask);
             }
-            VncInputEvent::Key { down, key } => {
+            event @ VncInputEvent::Key {
+                client_id,
+                down,
+                key,
+                ..
+            } => {
+                self.active_client_id = Some(client_id);
                 if update_modifier(&mut self.modifiers, key, down) {
                     return;
                 }
@@ -289,18 +348,33 @@ impl InputState {
                     });
                 }
                 if down {
-                    if let Some(ch) = (VncInputEvent::Key { down, key }).text() {
+                    if let Some(ch) = event.text() {
                         out.push(egui::Event::Text(ch.to_string()));
                     }
                 }
             }
-            VncInputEvent::ClientCutText(bytes) => {
-                if let Ok(text) = String::from_utf8(bytes) {
+            VncInputEvent::ClientCutText {
+                client_id, text, ..
+            } => {
+                self.active_client_id = Some(client_id);
+                if let Ok(text) = String::from_utf8(text) {
                     out.push(egui::Event::Paste(text));
                 }
             }
         }
     }
+}
+
+fn cursor_color(client_id: u64) -> egui::Color32 {
+    const COLORS: [egui::Color32; 6] = [
+        egui::Color32::from_rgb(255, 235, 118),
+        egui::Color32::from_rgb(86, 214, 190),
+        egui::Color32::from_rgb(255, 139, 148),
+        egui::Color32::from_rgb(150, 185, 255),
+        egui::Color32::from_rgb(184, 231, 111),
+        egui::Color32::from_rgb(231, 163, 255),
+    ];
+    COLORS[(client_id as usize).wrapping_sub(1) % COLORS.len()]
 }
 
 fn update_modifier(mods: &mut egui::Modifiers, key: u32, down: bool) -> bool {

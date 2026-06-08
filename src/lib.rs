@@ -1,6 +1,6 @@
 #![doc = include_str!("../README.md")]
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::{
@@ -65,12 +65,43 @@ impl Rect {
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub enum VncInputEvent {
-    Key { down: bool, key: u32 },
-    Pointer { button_mask: u8, x: u16, y: u16 },
-    ClientCutText(Vec<u8>),
+    Key {
+        client_id: u64,
+        peer: Option<SocketAddr>,
+        down: bool,
+        key: u32,
+    },
+    Pointer {
+        client_id: u64,
+        peer: Option<SocketAddr>,
+        button_mask: u8,
+        x: u16,
+        y: u16,
+    },
+    ClientCutText {
+        client_id: u64,
+        peer: Option<SocketAddr>,
+        text: Vec<u8>,
+    },
 }
 
 impl VncInputEvent {
+    pub fn client_id(&self) -> u64 {
+        match self {
+            Self::Key { client_id, .. }
+            | Self::Pointer { client_id, .. }
+            | Self::ClientCutText { client_id, .. } => *client_id,
+        }
+    }
+
+    pub fn peer(&self) -> Option<SocketAddr> {
+        match self {
+            Self::Key { peer, .. }
+            | Self::Pointer { peer, .. }
+            | Self::ClientCutText { peer, .. } => *peer,
+        }
+    }
+
     pub fn pointer_position(&self) -> Option<(u16, u16)> {
         match *self {
             Self::Pointer { x, y, .. } => Some((x, y)),
@@ -111,10 +142,22 @@ impl VncInputEvent {
 
     pub fn text(&self) -> Option<char> {
         match *self {
-            Self::Key { down: true, key } => VncKey::from_keysym(key).text(),
+            Self::Key {
+                down: true, key, ..
+            } => VncKey::from_keysym(key).text(),
             _ => None,
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VncCursor {
+    pub client_id: u64,
+    pub peer: Option<SocketAddr>,
+    pub x: u16,
+    pub y: u16,
+    pub button_mask: u8,
+    pub position_known: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -314,6 +357,16 @@ impl VncServerHandle {
         self.state.active_clients.load(Ordering::Acquire)
     }
 
+    pub fn client_cursors(&self) -> Vec<VncCursor> {
+        self.state
+            .cursors
+            .lock()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect()
+    }
+
     pub fn set_clipboard_text(&self, text: impl Into<Vec<u8>>) {
         let mut inner = self.state.clipboard.inner.lock().unwrap();
         inner.seq = inner.seq.wrapping_add(1);
@@ -328,6 +381,7 @@ struct ServerState {
     active_clients: AtomicUsize,
     next_client_id: AtomicU64,
     clipboard: ServerClipboard,
+    cursors: Mutex<HashMap<u64, VncCursor>>,
 }
 
 impl ServerState {
@@ -343,6 +397,7 @@ impl ServerState {
                 }),
                 cond: Condvar::new(),
             },
+            cursors: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -473,6 +528,17 @@ pub fn start_vnc_server(
                         let client_state = Arc::clone(&listener_state);
                         let client_id = client_state.next_client_id.fetch_add(1, Ordering::AcqRel);
                         client_state.active_clients.fetch_add(1, Ordering::AcqRel);
+                        client_state.cursors.lock().unwrap().insert(
+                            client_id,
+                            VncCursor {
+                                client_id,
+                                peer,
+                                x: 0,
+                                y: 0,
+                                button_mask: 0,
+                                position_known: false,
+                            },
+                        );
                         if let Some(cb) = &config.client_callback {
                             cb(VncClientEvent::Connected {
                                 id: client_id,
@@ -486,8 +552,11 @@ pub fn start_vnc_server(
                                 config.name.clone(),
                                 config.clone(),
                                 Arc::clone(&client_state),
+                                client_id,
+                                peer,
                             );
                             client_state.active_clients.fetch_sub(1, Ordering::AcqRel);
+                            client_state.cursors.lock().unwrap().remove(&client_id);
                             let reason = result.as_ref().err().map(|e| e.to_string());
                             if let Some(cb) = &config.client_callback {
                                 cb(VncClientEvent::Disconnected {
@@ -706,6 +775,8 @@ fn handle_vnc_client(
     name: String,
     config: VncServerConfig,
     server_state: Arc<ServerState>,
+    client_id: u64,
+    peer: Option<SocketAddr>,
 ) -> io::Result<()> {
     stream.set_nodelay(true).ok();
 
@@ -868,6 +939,8 @@ fn handle_vnc_client(
                         } else {
                             if let Some(cb) = &input_callback {
                                 cb(VncInputEvent::Key {
+                                    client_id,
+                                    peer,
                                     down: body[0] != 0,
                                     key: u32::from_be_bytes([body[3], body[4], body[5], body[6]]),
                                 });
@@ -880,11 +953,24 @@ fn handle_vnc_client(
                         if reader.read_exact(&mut body).is_err() {
                             false
                         } else {
+                            let button_mask = body[0];
+                            let x = u16::from_be_bytes([body[1], body[2]]);
+                            let y = u16::from_be_bytes([body[3], body[4]]);
+                            if let Some(cursor) =
+                                reader_state.cursors.lock().unwrap().get_mut(&client_id)
+                            {
+                                cursor.x = x;
+                                cursor.y = y;
+                                cursor.button_mask = button_mask;
+                                cursor.position_known = true;
+                            }
                             if let Some(cb) = &input_callback {
                                 cb(VncInputEvent::Pointer {
-                                    button_mask: body[0],
-                                    x: u16::from_be_bytes([body[1], body[2]]),
-                                    y: u16::from_be_bytes([body[3], body[4]]),
+                                    client_id,
+                                    peer,
+                                    button_mask,
+                                    x,
+                                    y,
                                 });
                             }
                             true
@@ -901,7 +987,11 @@ fn handle_vnc_client(
                                 false
                             } else {
                                 if let Some(cb) = &input_callback {
-                                    cb(VncInputEvent::ClientCutText(text));
+                                    cb(VncInputEvent::ClientCutText {
+                                        client_id,
+                                        peer,
+                                        text,
+                                    });
                                 }
                                 true
                             }
@@ -1192,15 +1282,20 @@ mod tests {
     #[test]
     fn input_helpers_decode_buttons_wheel_and_text() {
         let event = VncInputEvent::Pointer {
+            client_id: 7,
+            peer: None,
             button_mask: VncMouseButton::Left.mask() | VncMouseButton::WheelUp.mask(),
             x: 10,
             y: 20,
         };
+        assert_eq!(event.client_id(), 7);
         assert_eq!(event.pointer_position(), Some((10, 20)));
         assert!(event.is_button_down(VncMouseButton::Left));
         assert_eq!(event.wheel_delta(VncMouseButton::Left.mask()), 1);
 
         let key = VncInputEvent::Key {
+            client_id: 7,
+            peer: None,
             down: true,
             key: b'a' as u32,
         };

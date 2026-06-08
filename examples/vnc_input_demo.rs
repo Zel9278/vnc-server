@@ -8,13 +8,15 @@
 // printed to the console. Pointer and mouse button state are also rendered into
 // the streamed framebuffer.
 
+use std::collections::HashMap;
 use std::env;
 use std::io;
 use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 use vnc_server::{
-    SharedFrame, VncClientEvent, VncInputEvent, VncMouseButton, VncServerConfig, start_vnc_server,
+    SharedFrame, VncClientEvent, VncCursor, VncInputEvent, VncMouseButton, VncServerConfig,
+    start_vnc_server,
 };
 
 const WIDTH: u16 = 800;
@@ -25,6 +27,8 @@ struct DemoState {
     pointer_x: u16,
     pointer_y: u16,
     button_mask: u8,
+    active_client_id: Option<u64>,
+    client_button_masks: HashMap<u64, u8>,
     last_key: Option<u32>,
     key_down: bool,
     cut_text_len: usize,
@@ -42,6 +46,8 @@ impl DemoState {
             pointer_x: WIDTH / 2,
             pointer_y: HEIGHT / 2,
             button_mask: 0,
+            active_client_id: None,
+            client_button_masks: HashMap::new(),
             last_key: None,
             key_down: false,
             cut_text_len: 0,
@@ -95,11 +101,22 @@ fn main() -> io::Result<()> {
             state.event_count += 1;
             state.flash_until = Instant::now() + Duration::from_millis(120);
             match event {
-                VncInputEvent::Pointer { button_mask, x, y } => {
+                event @ VncInputEvent::Pointer {
+                    client_id,
+                    button_mask,
+                    x,
+                    y,
+                    ..
+                } => {
                     state.pointer_x = x.min(WIDTH.saturating_sub(1));
                     state.pointer_y = y.min(HEIGHT.saturating_sub(1));
-                    let wheel =
-                        VncInputEvent::Pointer { button_mask, x, y }.wheel_delta(state.button_mask);
+                    state.active_client_id = Some(client_id);
+                    let previous_mask = state
+                        .client_button_masks
+                        .get(&client_id)
+                        .copied()
+                        .unwrap_or(0);
+                    let wheel = event.wheel_delta(previous_mask);
                     if wheel > 0 {
                         state.wheel_up_count += 1;
                         state.wheel_flash_until = Instant::now() + Duration::from_millis(500);
@@ -109,12 +126,19 @@ fn main() -> io::Result<()> {
                         state.wheel_flash_until = Instant::now() + Duration::from_millis(500);
                     }
                     state.button_mask = button_mask;
+                    state.client_button_masks.insert(client_id, button_mask);
                     println!(
-                        "pointer x={} y={} buttons=0b{:08b} wheel_delta={}",
+                        "client #{client_id} pointer x={} y={} buttons=0b{:08b} wheel_delta={}",
                         state.pointer_x, state.pointer_y, button_mask, wheel
                     );
                 }
-                event @ VncInputEvent::Key { down, key } => {
+                event @ VncInputEvent::Key {
+                    client_id,
+                    down,
+                    key,
+                    ..
+                } => {
+                    state.active_client_id = Some(client_id);
                     state.last_key = Some(key);
                     state.key_down = down;
                     if let Some(ch) = event.text() {
@@ -123,22 +147,26 @@ fn main() -> io::Result<()> {
                         apply_control_key_to_text(&mut state.typed_text, key);
                     }
                     println!(
-                        "key {} keysym=0x{key:08x}",
+                        "client #{client_id} key {} keysym=0x{key:08x}",
                         if down { "down" } else { "up" }
                     );
                 }
-                VncInputEvent::ClientCutText(bytes) => {
-                    state.cut_text_len = bytes.len();
+                VncInputEvent::ClientCutText {
+                    client_id, text, ..
+                } => {
+                    state.active_client_id = Some(client_id);
+                    state.cut_text_len = text.len();
                     println!(
-                        "client cut text: {} bytes: {}",
-                        bytes.len(),
-                        String::from_utf8_lossy(&bytes)
+                        "client #{client_id} cut text: {} bytes: {}",
+                        text.len(),
+                        String::from_utf8_lossy(&text)
                     );
                 }
             }
         }
 
-        render(&mut pixels, &state);
+        let cursors = server.client_cursors();
+        render(&mut pixels, &state, &cursors);
         frame.publish(&pixels);
         thread::sleep(Duration::from_millis(33));
     }
@@ -223,7 +251,7 @@ fn print_server_help(example: &str, default_port: u16) {
     );
 }
 
-fn render(pixels: &mut [u8], state: &DemoState) {
+fn render(pixels: &mut [u8], state: &DemoState, cursors: &[VncCursor]) {
     clear(pixels, [24, 28, 34, 255]);
     draw_grid(pixels);
 
@@ -263,6 +291,21 @@ fn render(pixels: &mut [u8], state: &DemoState) {
         ),
         [214, 222, 230, 255],
         2,
+    );
+    draw_text(
+        pixels,
+        588,
+        42,
+        &format!(
+            "CLIENTS {} ACTIVE {}",
+            cursors.len(),
+            state
+                .active_client_id
+                .map(|id| format!("#{id}"))
+                .unwrap_or_else(|| "-".to_string())
+        ),
+        [185, 198, 210, 255],
+        1,
     );
     fill_rect(pixels, 24, 150, 752, 40, [22, 25, 30, 255]);
     stroke_rect(pixels, 24, 150, 752, 40, [86, 100, 114, 255]);
@@ -326,7 +369,18 @@ fn render(pixels: &mut [u8], state: &DemoState) {
         2,
     );
 
-    draw_crosshair(pixels, state.pointer_x as i32, state.pointer_y as i32);
+    for cursor in cursors.iter().filter(|cursor| cursor.position_known) {
+        let color = cursor_color(cursor.client_id);
+        draw_crosshair(pixels, cursor.x as i32, cursor.y as i32, color);
+        draw_text(
+            pixels,
+            cursor.x as i32 + 12,
+            cursor.y as i32 + 12,
+            &format!("C{}", cursor.client_id),
+            color,
+            1,
+        );
+    }
 }
 
 fn apply_control_key_to_text(text: &mut String, key: u32) {
@@ -384,10 +438,22 @@ fn draw_grid(pixels: &mut [u8]) {
     }
 }
 
-fn draw_crosshair(pixels: &mut [u8], x: i32, y: i32) {
-    fill_rect(pixels, x - 16, y, 33, 2, [255, 235, 118, 255]);
-    fill_rect(pixels, x, y - 16, 2, 33, [255, 235, 118, 255]);
-    stroke_rect(pixels, x - 7, y - 7, 16, 16, [255, 235, 118, 255]);
+fn draw_crosshair(pixels: &mut [u8], x: i32, y: i32, color: [u8; 4]) {
+    fill_rect(pixels, x - 16, y, 33, 2, color);
+    fill_rect(pixels, x, y - 16, 2, 33, color);
+    stroke_rect(pixels, x - 7, y - 7, 16, 16, color);
+}
+
+fn cursor_color(client_id: u64) -> [u8; 4] {
+    const COLORS: [[u8; 4]; 6] = [
+        [255, 235, 118, 255],
+        [86, 214, 190, 255],
+        [255, 139, 148, 255],
+        [150, 185, 255, 255],
+        [184, 231, 111, 255],
+        [231, 163, 255, 255],
+    ];
+    COLORS[(client_id as usize).wrapping_sub(1) % COLORS.len()]
 }
 
 fn fill_rect(pixels: &mut [u8], x: i32, y: i32, w: i32, h: i32, color: [u8; 4]) {
