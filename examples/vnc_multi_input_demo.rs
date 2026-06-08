@@ -1,7 +1,7 @@
 // Multi-client VNC input test server.
 //
 // Usage:
-//   cargo run --example vnc_multi_input_demo -- [--host HOST] [--port PORT] [--passwd PASS]
+//   cargo run --example vnc_multi_input_demo -- [--host HOST] [--port PORT] [--passwd PASS] [--low-bandwidth]
 //
 // Connect two or more VNC clients to the same address. Each client gets its own
 // cursor color, button state, and typed text buffer.
@@ -167,6 +167,10 @@ fn main() -> io::Result<()> {
         config = config.with_password(password);
         println!("VNC password authentication enabled");
     }
+    if opts.low_bandwidth {
+        config = config.with_low_bandwidth();
+        println!("Low-bandwidth mode enabled: preferred pixel format is RGB565");
+    }
 
     let server = start_vnc_server(Arc::clone(&frame), config)?;
     println!(
@@ -193,6 +197,7 @@ struct ServerCli {
     host: String,
     port: u16,
     passwd: Option<String>,
+    low_bandwidth: bool,
     help: bool,
 }
 
@@ -202,6 +207,7 @@ impl ServerCli {
             host: "127.0.0.1".to_string(),
             port: default_port,
             passwd: None,
+            low_bandwidth: false,
             help: false,
         };
         let mut positional = Vec::new();
@@ -209,6 +215,7 @@ impl ServerCli {
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "-h" | "--help" => out.help = true,
+                "--low-bandwidth" => out.low_bandwidth = true,
                 "--host" => out.host = args.next().ok_or_else(|| missing_value("--host"))?,
                 "--port" => {
                     out.port = parse_port(&args.next().ok_or_else(|| missing_value("--port"))?)?;
@@ -262,7 +269,7 @@ fn missing_value(name: &str) -> io::Error {
 
 fn print_server_help(example: &str, default_port: u16) {
     println!(
-        "Usage: cargo run --example {example} -- [OPTIONS]\n\nOptions:\n  --host HOST        Bind host/address, e.g. 127.0.0.1 or 0.0.0.0 (default: 127.0.0.1)\n  --port PORT        Bind port (default: {default_port})\n  --passwd PASS      Enable VNC password authentication\n  --password PASS    Alias for --passwd\n  -h, --help         Show this help\n\nBackward-compatible positional form:\n  cargo run --example {example} -- [port] [password]\n"
+        "Usage: cargo run --example {example} -- [OPTIONS]\n\nOptions:\n  --host HOST        Bind host/address, e.g. 127.0.0.1 or 0.0.0.0 (default: 127.0.0.1)\n  --port PORT        Bind port (default: {default_port})\n  --passwd PASS      Enable VNC password authentication\n  --password PASS    Alias for --passwd\n  --low-bandwidth    Prefer 16bpp RGB565 for clients that accept it\n  -h, --help         Show this help\n\nBackward-compatible positional form:\n  cargo run --example {example} -- [port] [password]\n"
     );
 }
 

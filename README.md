@@ -2,7 +2,7 @@
 
 Small standalone RFB/VNC server module.
 
-This crate streams top-down BGRA/BGRX frames through VNC. It supports output-only mode, input callbacks, client connect/disconnect callbacks, max-client limits, bidirectional clipboard messages, standard VNC password authentication, Raw encoding, Hextile encoding, and tile-based damage tracking.
+This crate streams top-down BGRA/BGRX frames through VNC. It supports output-only mode, input callbacks, client connect/disconnect callbacks, max-client limits, bidirectional clipboard messages, standard VNC password authentication, Raw, Hextile, Zlib, and ZRLE encodings, optional 16bpp RGB565 preferred output, and tile-based damage tracking.
 
 ## Use
 
@@ -130,6 +130,18 @@ let config = VncServerConfig::new().with_password("secret");
 
 VNC password authentication uses the classic VNC challenge-response scheme. Only the first 8 password bytes are used by the protocol. You can check this with `VncAuth::password_is_truncated()`.
 
+Low-bandwidth mode:
+
+```rust
+use vnc_server::{VncPixelFormat, VncServerConfig};
+
+let config = VncServerConfig::new()
+    .with_low_bandwidth()
+    .with_preferred_pixel_format(VncPixelFormat::rgb565());
+```
+
+`with_low_bandwidth()` advertises 16bpp RGB565 in ServerInit. Clients may still send `SetPixelFormat`; the server follows the client's requested format when it does. If a client requests ZRLE or Zlib in `SetEncodings`, the server prefers `ZRLE`, then `Zlib`, then `Hextile`, then `Raw`.
+
 ## Examples
 
 Basic framebuffer server:
@@ -151,6 +163,12 @@ cargo run --example vnc_multi_input_demo -- --host 127.0.0.1 --port 5904
 ```
 
 Connect two or more VNC clients to port `5904`. Each client has an independent cursor color, button state, and typed text buffer.
+
+Low-bandwidth input demo:
+
+```powershell
+cargo run --example vnc_input_demo -- --host 0.0.0.0 --port 5902 --low-bandwidth
+```
 
 Listen on every network interface with password auth:
 
@@ -182,6 +200,13 @@ Probe with Hextile encoding:
 cargo run --example vnc_probe -- --host 127.0.0.1 --port 5902 --encoding hextile
 ```
 
+Probe with Zlib or ZRLE encoding:
+
+```powershell
+cargo run --example vnc_probe -- --host 127.0.0.1 --port 5902 --encoding zlib
+cargo run --example vnc_probe -- --host 127.0.0.1 --port 5902 --encoding zrle
+```
+
 Probe a password-protected server:
 
 ```powershell
@@ -198,7 +223,8 @@ cargo run --example vnc_egui_headless -- --help
 
 - RFB 3.8 with compatibility for 3.7/3.3 clients.
 - No TLS; bind to `127.0.0.1` unless you add an access-control layer.
-- Raw and Hextile encodings.
+- Raw, Hextile, Zlib, and ZRLE encodings.
+- `VncServerConfig::with_low_bandwidth()` advertises 16bpp RGB565 before clients override the pixel format.
 - Incremental requests use tile-based dirty rectangles.
 - `VncInputEvent` includes client IDs, peer addresses, and helpers for pointer position, button masks, wheel deltas, and printable key text.
 - `VncServerHandle` exposes shutdown, active client count, local address, per-client cursors, and server-to-client clipboard sending.

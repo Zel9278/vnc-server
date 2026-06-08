@@ -4,15 +4,19 @@
 //   bpp = 16    -> send a RealVNC-style 16bpp 565 SetPixelFormat
 //   bpp = 32rgbx-> send a 32bpp RGBX (non-native shift) SetPixelFormat
 //   bpp = hextile -> request Hextile encoding
+//   bpp = zlib    -> request Zlib encoding
+//   bpp = zrle    -> request ZRLE encoding
 // Reads several continuous frames, checks each FramebufferUpdate stays aligned,
 // and writes the last frame to %TEMP%\vnc_probe.bmp.
 
 use std::env;
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
+use std::time::Duration;
 
 use des::Des;
 use des::cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray};
+use flate2::{Decompress, FlushDecompress};
 
 fn read_exact(s: &mut TcpStream, n: usize) -> Vec<u8> {
     let mut buf = vec![0u8; n];
@@ -33,6 +37,7 @@ fn main() {
 
     let mut s = TcpStream::connect((opts.host.as_str(), opts.port)).expect("connect");
     s.set_nodelay(true).ok();
+    s.set_read_timeout(Some(Duration::from_secs(10))).ok();
 
     let ver = read_exact(&mut s, 12);
     println!("server version: {}", String::from_utf8_lossy(&ver).trim());
@@ -76,7 +81,8 @@ fn main() {
     );
 
     // Optionally override pixel format like a real client.
-    let bytespp: usize = match opts.mode.as_str() {
+    let mut bytespp: usize = (init[4] / 8).max(1) as usize;
+    match opts.mode.as_str() {
         "16" => {
             // 16bpp 565: bpp=16 depth=16 BE=0 TC=1 rmax=31 gmax=63 bmax=31 rs=11 gs=5 bs=0
             let pf = [16u8, 16, 0, 1, 0, 31, 0, 63, 0, 31, 11, 5, 0, 0, 0, 0];
@@ -84,7 +90,7 @@ fn main() {
             msg.extend_from_slice(&pf);
             s.write_all(&msg).unwrap();
             println!("sent SetPixelFormat 16bpp 565");
-            2
+            bytespp = 2;
         }
         "32rgbx" => {
             // 32bpp with RGBX layout: rs=0 gs=8 bs=16 (non-native).
@@ -93,19 +99,25 @@ fn main() {
             msg.extend_from_slice(&pf);
             s.write_all(&msg).unwrap();
             println!("sent SetPixelFormat 32bpp RGBX");
-            4
+            bytespp = 4;
         }
-        "hextile" | _ => {
-            println!("using server native format (32bpp)");
-            4
+        _ => {
+            println!("using server preferred format ({}bpp)", init[4]);
         }
-    };
-    if opts.mode == "hextile" {
-        let mut msg = vec![2u8, 0, 0, 2];
+    }
+    if matches!(opts.mode.as_str(), "hextile" | "zlib" | "zrle") {
+        let preferred = match opts.mode.as_str() {
+            "zrle" => 16i32,
+            "zlib" => 6,
+            "hextile" => 5,
+            _ => unreachable!(),
+        };
+        let mut msg = vec![2u8, 0, 0, 3];
+        msg.extend_from_slice(&preferred.to_be_bytes());
         msg.extend_from_slice(&5i32.to_be_bytes());
         msg.extend_from_slice(&0i32.to_be_bytes());
         s.write_all(&msg).unwrap();
-        println!("sent SetEncodings Hextile, Raw");
+        println!("sent SetEncodings {preferred}, Hextile, Raw");
     }
 
     // One initial (non-incremental) FramebufferUpdateRequest.
@@ -114,17 +126,12 @@ fn main() {
     req.extend_from_slice(&h.to_be_bytes());
     s.write_all(&req).unwrap();
 
-    let frames = 5;
+    let frames = 2;
     let mut last_pixels = Vec::new();
+    let mut zlib_decoder = Decompress::new(true);
+    let mut zrle_decoder = Decompress::new(true);
     for f in 0..frames {
-        let hdr = read_exact(&mut s, 4);
-        if hdr[0] != 0 {
-            println!(
-                "FRAME {f}: MISALIGNED! first byte = {} (expected 0)",
-                hdr[0]
-            );
-            return;
-        }
+        let hdr = read_framebuffer_update_header(&mut s);
         let nrect = u16::from_be_bytes([hdr[2], hdr[3]]);
         let mut total = 0usize;
         for _ in 0..nrect {
@@ -132,10 +139,12 @@ fn main() {
             let rw = u16::from_be_bytes([r[4], r[5]]) as usize;
             let rh = u16::from_be_bytes([r[6], r[7]]) as usize;
             let enc = i32::from_be_bytes([r[8], r[9], r[10], r[11]]);
-            let px = if enc == 5 {
-                read_hextile_rect(&mut s, rw, rh, bytespp)
-            } else {
-                read_exact(&mut s, rw * rh * bytespp)
+            println!("FRAME {f}: rect header {rw}x{rh} enc={enc}");
+            let px = match enc {
+                5 => read_hextile_rect(&mut s, rw, rh, bytespp),
+                6 => read_zlib_rect(&mut s, rw * rh * bytespp, &mut zlib_decoder),
+                16 => read_zrle_rect(&mut s, rw, rh, bytespp, &mut zrle_decoder),
+                _ => read_exact(&mut s, rw * rh * bytespp),
             };
             let bytes = px.len();
             total += bytes;
@@ -154,10 +163,31 @@ fn main() {
     }
 
     // Dump last frame to BMP (only meaningful for 32bpp BGRX native).
-    if bytespp == 4 {
+    if bytespp == 4 && opts.mode != "zrle" {
         let path = std::env::temp_dir().join("vnc_probe.bmp");
         write_bmp(&path, &last_pixels, w as u32, h as u32);
         println!("wrote {}", path.display());
+    }
+}
+
+fn read_framebuffer_update_header(s: &mut TcpStream) -> [u8; 4] {
+    loop {
+        let msg_type = read_exact(s, 1)[0];
+        match msg_type {
+            0 => {
+                let rest = read_exact(s, 3);
+                return [0, rest[0], rest[1], rest[2]];
+            }
+            3 => {
+                let hdr = read_exact(s, 7);
+                let len = u32::from_be_bytes([hdr[3], hdr[4], hdr[5], hdr[6]]) as usize;
+                let text = read_exact(s, len);
+                println!("server cut text: {} bytes", text.len());
+            }
+            other => {
+                panic!("unexpected server message type {other}");
+            }
+        }
     }
 }
 
@@ -251,7 +281,7 @@ fn missing_value(name: &str) -> io::Error {
 
 fn print_probe_help() {
     println!(
-        "Usage: cargo run --example vnc_probe -- [OPTIONS]\n\nOptions:\n  --host HOST          Connect host/address (default: 127.0.0.1)\n  --port PORT          Connect port (default: 5901)\n  --bpp MODE           Pixel/encoding mode: native, 16, 32rgbx, hextile\n  --encoding MODE      Alias for --bpp\n  --passwd PASS        VNC password\n  --password PASS      Alias for --passwd\n  -h, --help           Show this help\n\nBackward-compatible positional form:\n  cargo run --example vnc_probe -- [port] [bpp] [password]\n"
+        "Usage: cargo run --example vnc_probe -- [OPTIONS]\n\nOptions:\n  --host HOST          Connect host/address (default: 127.0.0.1)\n  --port PORT          Connect port (default: 5901)\n  --bpp MODE           Pixel/encoding mode: native, 16, 32rgbx, hextile, zlib, zrle\n  --encoding MODE      Alias for --bpp\n  --passwd PASS        VNC password\n  --password PASS      Alias for --passwd\n  -h, --help           Show this help\n\nBackward-compatible positional form:\n  cargo run --example vnc_probe -- [port] [bpp] [password]\n"
     );
 }
 
@@ -273,6 +303,50 @@ fn read_hextile_rect(s: &mut TcpStream, width: usize, height: usize, bytespp: us
         }
     }
     pixels
+}
+
+fn read_zlib_rect(s: &mut TcpStream, expected_len: usize, decoder: &mut Decompress) -> Vec<u8> {
+    let len = u32::from_be_bytes(read_exact_array(s)) as usize;
+    let compressed = read_exact(s, len);
+    let mut out = Vec::with_capacity(expected_len + 64);
+    decoder
+        .decompress_vec(&compressed, &mut out, FlushDecompress::Sync)
+        .expect("zlib decode");
+    assert_eq!(out.len(), expected_len, "unexpected zlib output length");
+    out
+}
+
+fn read_zrle_rect(
+    s: &mut TcpStream,
+    width: usize,
+    height: usize,
+    bytespp: usize,
+    decoder: &mut Decompress,
+) -> Vec<u8> {
+    let cpixel = if bytespp == 4 { 3 } else { bytespp };
+    let tile_count = width.div_ceil(64) * height.div_ceil(64);
+    let payload = read_zlib_rect(s, tile_count + width * height * cpixel, decoder);
+    let mut offset = 0usize;
+    let mut pixels = Vec::new();
+    for tile_y in (0..height).step_by(64) {
+        for tile_x in (0..width).step_by(64) {
+            let tile_w = (width - tile_x).min(64);
+            let tile_h = (height - tile_y).min(64);
+            let subencoding = payload[offset];
+            offset += 1;
+            assert_eq!(subencoding, 0, "probe only supports raw ZRLE tiles");
+            let tile_len = tile_w * tile_h * cpixel;
+            pixels.extend_from_slice(&payload[offset..offset + tile_len]);
+            offset += tile_len;
+        }
+    }
+    pixels
+}
+
+fn read_exact_array<const N: usize>(s: &mut TcpStream) -> [u8; N] {
+    let mut buf = [0u8; N];
+    s.read_exact(&mut buf).expect("read_exact");
+    buf
 }
 
 fn vnc_password_response(password: &str, challenge: [u8; 16]) -> [u8; 16] {

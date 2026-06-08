@@ -12,13 +12,17 @@ use std::time::Duration;
 
 use des::Des;
 use des::cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray};
+use flate2::{Compress, Compression, FlushCompress};
 
 const DAMAGE_HISTORY_LIMIT: usize = 128;
 const DAMAGE_TILE_SIZE: usize = 32;
 const MAX_UPDATE_RECTS: usize = 1024;
 const ENCODING_RAW: i32 = 0;
 const ENCODING_HEXTILE: i32 = 5;
+const ENCODING_ZLIB: i32 = 6;
+const ENCODING_ZRLE: i32 = 16;
 const HEXTILE_RAW: u8 = 1;
+const ZRLE_TILE_SIZE: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Rect {
@@ -257,6 +261,7 @@ pub struct VncServerConfig {
     pub client_callback: Option<VncClientCallback>,
     pub auth: VncAuth,
     pub max_clients: Option<usize>,
+    pub preferred_pixel_format: VncPixelFormat,
 }
 
 impl VncServerConfig {
@@ -293,6 +298,16 @@ impl VncServerConfig {
         self.max_clients = Some(max_clients);
         self
     }
+
+    pub fn with_preferred_pixel_format(mut self, pixel_format: VncPixelFormat) -> Self {
+        self.preferred_pixel_format = pixel_format;
+        self
+    }
+
+    pub fn with_low_bandwidth(mut self) -> Self {
+        self.preferred_pixel_format = VncPixelFormat::rgb565();
+        self
+    }
 }
 
 impl Default for VncServerConfig {
@@ -304,6 +319,7 @@ impl Default for VncServerConfig {
             client_callback: None,
             auth: VncAuth::None,
             max_clients: None,
+            preferred_pixel_format: VncPixelFormat::native(),
         }
     }
 }
@@ -628,24 +644,27 @@ fn vnc_password_response(password: &str, challenge: [u8; 16]) -> [u8; 16] {
     response
 }
 
-/// A client's requested RFB pixel format. Defaults to our native layout, which
-/// matches the Bgra8 readback byte order exactly (zero-copy fast path).
-#[derive(Clone, Copy)]
-struct VncPixelFormat {
-    bpp: u8,
-    big_endian: bool,
-    r_max: u16,
-    g_max: u16,
-    b_max: u16,
-    r_shift: u8,
-    g_shift: u8,
-    b_shift: u8,
+/// RFB pixel format used for ServerInit and client-requested SetPixelFormat.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VncPixelFormat {
+    pub bpp: u8,
+    pub depth: u8,
+    pub big_endian: bool,
+    pub true_color: bool,
+    pub r_max: u16,
+    pub g_max: u16,
+    pub b_max: u16,
+    pub r_shift: u8,
+    pub g_shift: u8,
+    pub b_shift: u8,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VncEncoding {
     Raw,
     Hextile,
+    Zlib,
+    Zrle,
 }
 
 impl VncEncoding {
@@ -653,16 +672,20 @@ impl VncEncoding {
         match self {
             Self::Raw => ENCODING_RAW,
             Self::Hextile => ENCODING_HEXTILE,
+            Self::Zlib => ENCODING_ZLIB,
+            Self::Zrle => ENCODING_ZRLE,
         }
     }
 }
 
 impl VncPixelFormat {
     /// 32 bpp, little-endian, R<<16 | G<<8 | B => bytes [B,G,R,X].
-    fn native() -> Self {
+    pub fn native() -> Self {
         Self {
             bpp: 32,
+            depth: 24,
             big_endian: false,
+            true_color: true,
             r_max: 255,
             g_max: 255,
             b_max: 255,
@@ -672,11 +695,30 @@ impl VncPixelFormat {
         }
     }
 
+    /// 16 bpp, little-endian RGB565. Many VNC clients accept this as the
+    /// server's preferred low-bandwidth format.
+    pub fn rgb565() -> Self {
+        Self {
+            bpp: 16,
+            depth: 16,
+            big_endian: false,
+            true_color: true,
+            r_max: 31,
+            g_max: 63,
+            b_max: 31,
+            r_shift: 11,
+            g_shift: 5,
+            b_shift: 0,
+        }
+    }
+
     /// Parse the 16-byte PIXEL_FORMAT structure sent by SetPixelFormat.
     fn parse(b: &[u8; 16]) -> Self {
         Self {
             bpp: b[0],
+            depth: b[1],
             big_endian: b[2] != 0,
+            true_color: b[3] != 0,
             r_max: u16::from_be_bytes([b[4], b[5]]),
             g_max: u16::from_be_bytes([b[6], b[7]]),
             b_max: u16::from_be_bytes([b[8], b[9]]),
@@ -686,9 +728,28 @@ impl VncPixelFormat {
         }
     }
 
+    fn write_to(self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&[
+            self.bpp,
+            self.depth,
+            u8::from(self.big_endian),
+            u8::from(self.true_color),
+        ]);
+        out.extend_from_slice(&self.r_max.to_be_bytes());
+        out.extend_from_slice(&self.g_max.to_be_bytes());
+        out.extend_from_slice(&self.b_max.to_be_bytes());
+        out.extend_from_slice(&[self.r_shift, self.g_shift, self.b_shift, 0, 0, 0]);
+    }
+
+    fn bytes_per_pixel(self) -> usize {
+        (self.bpp / 8).max(1) as usize
+    }
+
     fn is_native(&self) -> bool {
         self.bpp == 32
+            && self.depth == 24
             && !self.big_endian
+            && self.true_color
             && self.r_max == 255
             && self.g_max == 255
             && self.b_max == 255
@@ -714,29 +775,54 @@ fn encode_rect(bgra: &[u8], width: usize, rect: Rect, fmt: &VncPixelFormat, out:
         }
         return;
     }
-    let nbytes = (fmt.bpp / 8).max(1) as usize;
+    let nbytes = fmt.bytes_per_pixel();
     out.reserve(w * h * nbytes);
     for row in y..y + h {
         let start = (row * width + x) * 4;
         let end = start + w * 4;
         for px in bgra[start..end].chunks_exact(4) {
-            let b = px[0] as u32;
-            let g = px[1] as u32;
-            let r = px[2] as u32;
-            let rc = r * fmt.r_max as u32 / 255;
-            let gc = g * fmt.g_max as u32 / 255;
-            let bc = b * fmt.b_max as u32 / 255;
-            let val = ((rc << fmt.r_shift) | (gc << fmt.g_shift) | (bc << fmt.b_shift)) as u64;
-            if fmt.big_endian {
-                for i in (0..nbytes).rev() {
-                    out.push((val >> (i * 8)) as u8);
-                }
-            } else {
-                for i in 0..nbytes {
-                    out.push((val >> (i * 8)) as u8);
-                }
-            }
+            encode_pixel(px, fmt, out);
         }
+    }
+}
+
+fn encode_pixel(px: &[u8], fmt: &VncPixelFormat, out: &mut Vec<u8>) {
+    let b = px[0] as u32;
+    let g = px[1] as u32;
+    let r = px[2] as u32;
+    let rc = r * fmt.r_max as u32 / 255;
+    let gc = g * fmt.g_max as u32 / 255;
+    let bc = b * fmt.b_max as u32 / 255;
+    let val = ((rc << fmt.r_shift) | (gc << fmt.g_shift) | (bc << fmt.b_shift)) as u64;
+    let nbytes = fmt.bytes_per_pixel();
+    if fmt.big_endian {
+        for i in (0..nbytes).rev() {
+            out.push((val >> (i * 8)) as u8);
+        }
+    } else {
+        for i in 0..nbytes {
+            out.push((val >> (i * 8)) as u8);
+        }
+    }
+}
+
+fn encode_compact_pixel(px: &[u8], fmt: &VncPixelFormat, out: &mut Vec<u8>) {
+    let before = out.len();
+    encode_pixel(px, fmt, out);
+    if zrle_compact_pixel_bytes(fmt) == 3 && out.len() - before == 4 {
+        if fmt.big_endian {
+            out.remove(before);
+        } else {
+            out.pop();
+        }
+    }
+}
+
+fn zrle_compact_pixel_bytes(fmt: &VncPixelFormat) -> usize {
+    if fmt.bpp == 32 && fmt.true_color && fmt.r_max <= 255 && fmt.g_max <= 255 && fmt.b_max <= 255 {
+        3
+    } else {
+        fmt.bytes_per_pixel()
     }
 }
 
@@ -767,6 +853,81 @@ fn encode_hextile_rect(
             out.extend_from_slice(&tile_pixels);
         }
     }
+}
+
+fn encode_zlib_rect(
+    bgra: &[u8],
+    width: usize,
+    rect: Rect,
+    fmt: &VncPixelFormat,
+    compressor: &mut Compress,
+    out: &mut Vec<u8>,
+) -> io::Result<()> {
+    let mut raw = Vec::new();
+    encode_rect(bgra, width, rect, fmt, &mut raw);
+    encode_zlib_payload(&raw, compressor, out)
+}
+
+fn encode_zrle_rect(
+    bgra: &[u8],
+    width: usize,
+    rect: Rect,
+    fmt: &VncPixelFormat,
+    compressor: &mut Compress,
+    out: &mut Vec<u8>,
+) -> io::Result<()> {
+    let x0 = rect.x as usize;
+    let y0 = rect.y as usize;
+    let x1 = x0 + rect.width as usize;
+    let y1 = y0 + rect.height as usize;
+    let compact = zrle_compact_pixel_bytes(fmt);
+    let mut raw = Vec::new();
+    raw.reserve(rect.width as usize * rect.height as usize * compact + 64);
+
+    for tile_y in (y0..y1).step_by(ZRLE_TILE_SIZE) {
+        for tile_x in (x0..x1).step_by(ZRLE_TILE_SIZE) {
+            let tile_w = (x1 - tile_x).min(ZRLE_TILE_SIZE);
+            let tile_h = (y1 - tile_y).min(ZRLE_TILE_SIZE);
+            raw.push(0);
+            for row in tile_y..tile_y + tile_h {
+                let start = (row * width + tile_x) * 4;
+                let end = start + tile_w * 4;
+                for px in bgra[start..end].chunks_exact(4) {
+                    encode_compact_pixel(px, fmt, &mut raw);
+                }
+            }
+        }
+    }
+
+    encode_zlib_payload(&raw, compressor, out)
+}
+
+fn encode_zlib_payload(raw: &[u8], compressor: &mut Compress, out: &mut Vec<u8>) -> io::Result<()> {
+    let mut compressed = Vec::with_capacity(raw.len().saturating_add(1024).max(128));
+    let mut offset = 0usize;
+    while offset < raw.len() {
+        compressed.reserve(raw.len().saturating_sub(offset).saturating_add(1024));
+        let before_in = compressor.total_in();
+        compressor
+            .compress_vec(&raw[offset..], &mut compressed, FlushCompress::None)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let consumed = (compressor.total_in() - before_in) as usize;
+        if consumed == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "zlib compressor made no input progress",
+            ));
+        }
+        offset += consumed;
+    }
+    compressed.reserve(1024);
+    compressor
+        .compress_vec(&[], &mut compressed, FlushCompress::Sync)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    out.clear();
+    out.extend_from_slice(&(compressed.len() as u32).to_be_bytes());
+    out.extend_from_slice(&compressed);
+    Ok(())
 }
 
 fn handle_vnc_client(
@@ -834,13 +995,13 @@ fn handle_vnc_client(
     let mut init = Vec::with_capacity(24 + name.len());
     init.extend_from_slice(&width.to_be_bytes());
     init.extend_from_slice(&height.to_be_bytes());
-    init.extend_from_slice(&[32, 24, 0, 1, 0, 255, 0, 255, 0, 255, 16, 8, 0, 0, 0, 0]);
+    config.preferred_pixel_format.write_to(&mut init);
     init.extend_from_slice(&(name.len() as u32).to_be_bytes());
     init.extend_from_slice(name.as_bytes());
     stream.write_all(&init)?;
 
     let client_request = Arc::new((Mutex::new(None::<UpdateRequest>), Condvar::new()));
-    let pixel_format = Arc::new(Mutex::new(VncPixelFormat::native()));
+    let pixel_format = Arc::new(Mutex::new(config.preferred_pixel_format));
     let encoding = Arc::new(Mutex::new(VncEncoding::Raw));
     {
         let client_request = Arc::clone(&client_request);
@@ -898,7 +1059,11 @@ fn handle_vnc_client(
                                     requested
                                         .push(i32::from_be_bytes([enc[0], enc[1], enc[2], enc[3]]));
                                 }
-                                let selected = if requested.contains(&ENCODING_HEXTILE) {
+                                let selected = if requested.contains(&ENCODING_ZRLE) {
+                                    VncEncoding::Zrle
+                                } else if requested.contains(&ENCODING_ZLIB) {
+                                    VncEncoding::Zlib
+                                } else if requested.contains(&ENCODING_HEXTILE) {
                                     VncEncoding::Hextile
                                 } else {
                                     VncEncoding::Raw
@@ -1009,6 +1174,8 @@ fn handle_vnc_client(
     let mut last_seq = 0u64;
     let mut last_clipboard_seq = 0u64;
     let mut encoded: Vec<u8> = Vec::new();
+    let mut zlib_compressor = Compress::new(Compression::fast(), true);
+    let mut zrle_compressor = Compress::new(Compression::fast(), true);
     while !server_state.shutdown.load(Ordering::Acquire) {
         if let Some(text) = clipboard_since(&server_state, last_clipboard_seq) {
             last_clipboard_seq = text.0;
@@ -1087,6 +1254,22 @@ fn handle_vnc_client(
                 VncEncoding::Hextile => {
                     encode_hextile_rect(&raw, width as usize, rect, &fmt, &mut encoded)
                 }
+                VncEncoding::Zlib => encode_zlib_rect(
+                    &raw,
+                    width as usize,
+                    rect,
+                    &fmt,
+                    &mut zlib_compressor,
+                    &mut encoded,
+                )?,
+                VncEncoding::Zrle => encode_zrle_rect(
+                    &raw,
+                    width as usize,
+                    rect,
+                    &fmt,
+                    &mut zrle_compressor,
+                    &mut encoded,
+                )?,
             }
             write_rect_header(&mut stream, rect, encoding)?;
             stream.write_all(&encoded)?;
@@ -1277,6 +1460,68 @@ mod tests {
         assert_eq!(out.len(), 4 + 20 * 20 * 4);
         assert_eq!(out[0], HEXTILE_RAW);
         assert_eq!(out[1 + 16 * 16 * 4], HEXTILE_RAW);
+    }
+
+    #[test]
+    fn compressed_encodings_write_length_prefixed_payloads() {
+        let frame = vec![0u8; 8 * 8 * 4];
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            width: 8,
+            height: 8,
+        };
+        let mut compressor = Compress::new(Compression::fast(), true);
+        let mut out = Vec::new();
+        encode_zlib_rect(
+            &frame,
+            8,
+            rect,
+            &VncPixelFormat::rgb565(),
+            &mut compressor,
+            &mut out,
+        )
+        .unwrap();
+        assert!(out.len() > 4);
+        let len = u32::from_be_bytes([out[0], out[1], out[2], out[3]]) as usize;
+        assert_eq!(len, out.len() - 4);
+
+        let mut compressor = Compress::new(Compression::fast(), true);
+        encode_zrle_rect(
+            &frame,
+            8,
+            rect,
+            &VncPixelFormat::rgb565(),
+            &mut compressor,
+            &mut out,
+        )
+        .unwrap();
+        assert!(out.len() > 4);
+        let len = u32::from_be_bytes([out[0], out[1], out[2], out[3]]) as usize;
+        assert_eq!(len, out.len() - 4);
+    }
+
+    #[test]
+    fn zlib_encoding_handles_full_demo_frame() {
+        let frame = vec![0u8; 800 * 480 * 4];
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 480,
+        };
+        let mut compressor = Compress::new(Compression::fast(), true);
+        let mut out = Vec::new();
+        encode_zlib_rect(
+            &frame,
+            800,
+            rect,
+            &VncPixelFormat::rgb565(),
+            &mut compressor,
+            &mut out,
+        )
+        .unwrap();
+        assert!(out.len() > 4);
     }
 
     #[test]

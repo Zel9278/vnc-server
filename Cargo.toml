@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 des = "0.8"
+flate2 = "1"
 rand = "0.9"
 
 [dev-dependencies]
