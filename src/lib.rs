@@ -439,6 +439,16 @@ pub fn start_vnc_server(
             while !listener_state.shutdown.load(Ordering::Acquire) {
                 match listener.accept() {
                     Ok((stream, peer_addr)) => {
+                        if let Err(e) = stream.set_nonblocking(false) {
+                            if let Some(cb) = &config.client_callback {
+                                cb(VncClientEvent::Rejected {
+                                    peer: Some(peer_addr),
+                                    reason: format!("failed to switch client socket to blocking: {e}"),
+                                });
+                            }
+                            drop(stream);
+                            continue;
+                        }
                         let peer = Some(peer_addr);
                         if let Some(max_clients) = config.max_clients {
                             if listener_state.active_clients.load(Ordering::Acquire) >= max_clients
