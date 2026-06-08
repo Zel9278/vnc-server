@@ -1,3 +1,5 @@
+#![doc = include_str!("../README.md")]
+
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
