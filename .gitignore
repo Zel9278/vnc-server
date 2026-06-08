@@ -1,0 +1,19 @@
+/target/
+
+# Rust/Cargo local artifacts
+**/*.rs.bk
+
+# Editor and IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Local environment files
+.env
+.env.*
+!.env.example

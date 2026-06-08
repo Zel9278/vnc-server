@@ -1,0 +1,15 @@
+[package]
+name = "vnc-server"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+des = "0.8"
+rand = "0.9"
+
+[dev-dependencies]
+egui = "0.34.2"
+egui-wgpu = "0.34.2"
+pollster = "0.4.0"
+wgpu = "29.0.3"
+
