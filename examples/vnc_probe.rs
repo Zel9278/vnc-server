@@ -1,5 +1,5 @@
 // Minimal RFB client probe to validate the server's framing/encoding.
-// Usage: vnc_probe <port> [bpp] [password]
+// Usage: vnc_probe [--host HOST] [--port PORT] [--bpp MODE] [--passwd PASS]
 //   bpp omitted -> use server's native format (no SetPixelFormat)
 //   bpp = 16    -> send a RealVNC-style 16bpp 565 SetPixelFormat
 //   bpp = 32rgbx-> send a 32bpp RGBX (non-native shift) SetPixelFormat
@@ -8,7 +8,7 @@
 // and writes the last frame to %TEMP%\vnc_probe.bmp.
 
 use std::env;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::net::TcpStream;
 
 use des::Des;
@@ -21,16 +21,17 @@ fn read_exact(s: &mut TcpStream, n: usize) -> Vec<u8> {
 }
 
 fn main() {
-    let mut args = env::args().skip(1);
-    let port: u16 = args
-        .next()
-        .unwrap_or_else(|| "5901".into())
-        .parse()
-        .unwrap();
-    let mode = args.next().unwrap_or_default();
-    let password = args.next();
+    let opts = ProbeCli::parse().unwrap_or_else(|e| {
+        eprintln!("{e}");
+        print_probe_help();
+        std::process::exit(2);
+    });
+    if opts.help {
+        print_probe_help();
+        return;
+    }
 
-    let mut s = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    let mut s = TcpStream::connect((opts.host.as_str(), opts.port)).expect("connect");
     s.set_nodelay(true).ok();
 
     let ver = read_exact(&mut s, 12);
@@ -39,7 +40,7 @@ fn main() {
 
     let sec = read_exact(&mut s, 2);
     println!("sec count={} type={}", sec[0], sec[1]);
-    let chosen = if password.is_some() { 2u8 } else { 1u8 };
+    let chosen = if opts.passwd.is_some() { 2u8 } else { 1u8 };
     if sec[1] != chosen {
         panic!(
             "server offered security type {}, but probe wants {}",
@@ -51,7 +52,7 @@ fn main() {
         let challenge = read_exact(&mut s, 16);
         let mut challenge_arr = [0u8; 16];
         challenge_arr.copy_from_slice(&challenge);
-        let response = vnc_password_response(password.as_deref().unwrap(), challenge_arr);
+        let response = vnc_password_response(opts.passwd.as_deref().unwrap(), challenge_arr);
         s.write_all(&response).unwrap();
     }
     let secres = read_exact(&mut s, 4);
@@ -75,7 +76,7 @@ fn main() {
     );
 
     // Optionally override pixel format like a real client.
-    let bytespp: usize = match mode.as_str() {
+    let bytespp: usize = match opts.mode.as_str() {
         "16" => {
             // 16bpp 565: bpp=16 depth=16 BE=0 TC=1 rmax=31 gmax=63 bmax=31 rs=11 gs=5 bs=0
             let pf = [16u8, 16, 0, 1, 0, 31, 0, 63, 0, 31, 11, 5, 0, 0, 0, 0];
@@ -99,7 +100,7 @@ fn main() {
             4
         }
     };
-    if mode == "hextile" {
+    if opts.mode == "hextile" {
         let mut msg = vec![2u8, 0, 0, 2];
         msg.extend_from_slice(&5i32.to_be_bytes());
         msg.extend_from_slice(&0i32.to_be_bytes());
@@ -158,6 +159,100 @@ fn main() {
         write_bmp(&path, &last_pixels, w as u32, h as u32);
         println!("wrote {}", path.display());
     }
+}
+
+struct ProbeCli {
+    host: String,
+    port: u16,
+    mode: String,
+    passwd: Option<String>,
+    help: bool,
+}
+
+impl ProbeCli {
+    fn parse() -> io::Result<Self> {
+        let mut out = Self {
+            host: "127.0.0.1".to_string(),
+            port: 5901,
+            mode: String::new(),
+            passwd: None,
+            help: false,
+        };
+        let mut positional = Vec::new();
+        let mut args = env::args().skip(1);
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "-h" | "--help" => out.help = true,
+                "--host" => out.host = args.next().ok_or_else(|| missing_value("--host"))?,
+                "--port" => {
+                    out.port = parse_port(&args.next().ok_or_else(|| missing_value("--port"))?)?;
+                }
+                "--bpp" | "--mode" | "--encoding" => {
+                    out.mode = args.next().ok_or_else(|| missing_value("--bpp"))?;
+                }
+                "--passwd" | "--password" => {
+                    out.passwd = Some(args.next().ok_or_else(|| missing_value("--passwd"))?);
+                }
+                _ if arg.starts_with("--host=") => {
+                    out.host = arg["--host=".len()..].to_string();
+                }
+                _ if arg.starts_with("--port=") => {
+                    out.port = parse_port(&arg["--port=".len()..])?;
+                }
+                _ if arg.starts_with("--bpp=") => {
+                    out.mode = arg["--bpp=".len()..].to_string();
+                }
+                _ if arg.starts_with("--mode=") => {
+                    out.mode = arg["--mode=".len()..].to_string();
+                }
+                _ if arg.starts_with("--encoding=") => {
+                    out.mode = arg["--encoding=".len()..].to_string();
+                }
+                _ if arg.starts_with("--passwd=") => {
+                    out.passwd = Some(arg["--passwd=".len()..].to_string());
+                }
+                _ if arg.starts_with("--password=") => {
+                    out.passwd = Some(arg["--password=".len()..].to_string());
+                }
+                _ if arg.starts_with('-') => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("unknown option: {arg}"),
+                    ));
+                }
+                _ => positional.push(arg),
+            }
+        }
+        if let Some(port) = positional.first() {
+            out.port = parse_port(port)?;
+        }
+        if let Some(mode) = positional.get(1) {
+            out.mode = mode.clone();
+        }
+        if let Some(passwd) = positional.get(2) {
+            out.passwd = Some(passwd.clone());
+        }
+        Ok(out)
+    }
+}
+
+fn parse_port(value: &str) -> io::Result<u16> {
+    value
+        .parse()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "port must be a number"))
+}
+
+fn missing_value(name: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("{name} requires a value"),
+    )
+}
+
+fn print_probe_help() {
+    println!(
+        "Usage: cargo run --example vnc_probe -- [OPTIONS]\n\nOptions:\n  --host HOST          Connect host/address (default: 127.0.0.1)\n  --port PORT          Connect port (default: 5901)\n  --bpp MODE           Pixel/encoding mode: native, 16, 32rgbx, hextile\n  --encoding MODE      Alias for --bpp\n  --passwd PASS        VNC password\n  --password PASS      Alias for --passwd\n  -h, --help           Show this help\n\nBackward-compatible positional form:\n  cargo run --example vnc_probe -- [port] [bpp] [password]\n"
+    );
 }
 
 fn read_hextile_rect(s: &mut TcpStream, width: usize, height: usize, bytespp: usize) -> Vec<u8> {

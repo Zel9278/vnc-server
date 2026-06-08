@@ -56,43 +56,49 @@ VNC password authentication uses the classic VNC challenge-response scheme. Only
 Input/click/keyboard demo:
 
 ```powershell
-cargo run --example vnc_input_demo -- 5902
+cargo run --example vnc_input_demo -- --host 127.0.0.1 --port 5902
 ```
 
-Input demo with password auth:
+Listen on every network interface with password auth:
 
 ```powershell
-cargo run --example vnc_input_demo -- 5902 secret
+cargo run --example vnc_input_demo -- --host 0.0.0.0 --port 5902 --passwd secret
 ```
 
 Headless egui + wgpu demo:
 
 ```powershell
-cargo run --example vnc_egui_headless -- 5903
+cargo run --example vnc_egui_headless -- --host 127.0.0.1 --port 5903
 ```
 
 Headless egui demo with password auth:
 
 ```powershell
-cargo run --example vnc_egui_headless -- 5903 secret
+cargo run --example vnc_egui_headless -- --host 0.0.0.0 --port 5903 --passwd secret
 ```
 
 Minimal RFB probe client for testing a running server:
 
 ```powershell
-cargo run --example vnc_probe -- 5902
+cargo run --example vnc_probe -- --host 127.0.0.1 --port 5902
 ```
 
 Probe with Hextile encoding:
 
 ```powershell
-cargo run --example vnc_probe -- 5902 hextile
+cargo run --example vnc_probe -- --host 127.0.0.1 --port 5902 --encoding hextile
 ```
 
 Probe a password-protected server:
 
 ```powershell
-cargo run --example vnc_probe -- 5902 native secret
+cargo run --example vnc_probe -- --host 127.0.0.1 --port 5902 --passwd secret
+```
+
+Show an example's CLI help:
+
+```powershell
+cargo run --example vnc_egui_headless -- --help
 ```
 
 ## Notes

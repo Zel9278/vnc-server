@@ -1,7 +1,7 @@
 // VNC input demo server.
 //
 // Usage:
-//   cargo run --example vnc_input_demo -- [port] [password]
+//   cargo run --example vnc_input_demo -- [--host HOST] [--port PORT] [--passwd PASS]
 //
 // Then connect a VNC client to 127.0.0.1:<port>.
 // Pointer movement, mouse buttons, clipboard text, and keyboard events are
@@ -56,13 +56,11 @@ impl DemoState {
 }
 
 fn main() -> io::Result<()> {
-    let mut args = env::args().skip(1);
-    let port: u16 = args
-        .next()
-        .unwrap_or_else(|| "5902".to_string())
-        .parse()
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "port must be a number"))?;
-    let password = args.next();
+    let opts = ServerCli::parse("vnc_input_demo", 5902)?;
+    if opts.help {
+        print_server_help("vnc_input_demo", 5902);
+        return Ok(());
+    }
 
     let frame = SharedFrame::new(WIDTH, HEIGHT);
     let (tx, rx) = mpsc::channel::<VncInputEvent>();
@@ -74,12 +72,12 @@ fn main() -> io::Result<()> {
     });
 
     let mut config = VncServerConfig::new()
-        .with_bind_addr(format!("127.0.0.1:{port}"))
+        .with_bind_addr(format!("{}:{}", opts.host, opts.port))
         .with_name("vnc-input-demo")
         .with_max_clients(4)
         .with_client_callback(client_events)
         .with_input_callback(input);
-    if let Some(password) = password {
+    if let Some(password) = opts.passwd {
         config = config.with_password(password);
         println!("VNC password authentication enabled");
     }
@@ -87,7 +85,7 @@ fn main() -> io::Result<()> {
     let server = start_vnc_server(Arc::clone(&frame), config)?;
     server.set_clipboard_text("hello from vnc-server");
 
-    println!("VNC input demo listening on 127.0.0.1:{port}");
+    println!("VNC input demo listening on {}:{}", opts.host, opts.port);
     println!("Move the pointer, click, type keys, or paste clipboard text in your VNC client.");
 
     let mut state = DemoState::new();
@@ -144,6 +142,85 @@ fn main() -> io::Result<()> {
         frame.publish(&pixels);
         thread::sleep(Duration::from_millis(33));
     }
+}
+
+struct ServerCli {
+    host: String,
+    port: u16,
+    passwd: Option<String>,
+    help: bool,
+}
+
+impl ServerCli {
+    fn parse(example: &str, default_port: u16) -> io::Result<Self> {
+        let mut out = Self {
+            host: "127.0.0.1".to_string(),
+            port: default_port,
+            passwd: None,
+            help: false,
+        };
+        let mut positional = Vec::new();
+        let mut args = env::args().skip(1);
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "-h" | "--help" => out.help = true,
+                "--host" => {
+                    out.host = args.next().ok_or_else(|| missing_value("--host"))?;
+                }
+                "--port" => {
+                    out.port = parse_port(&args.next().ok_or_else(|| missing_value("--port"))?)?;
+                }
+                "--passwd" | "--password" => {
+                    out.passwd = Some(args.next().ok_or_else(|| missing_value("--passwd"))?);
+                }
+                _ if arg.starts_with("--host=") => {
+                    out.host = arg["--host=".len()..].to_string();
+                }
+                _ if arg.starts_with("--port=") => {
+                    out.port = parse_port(&arg["--port=".len()..])?;
+                }
+                _ if arg.starts_with("--passwd=") => {
+                    out.passwd = Some(arg["--passwd=".len()..].to_string());
+                }
+                _ if arg.starts_with("--password=") => {
+                    out.passwd = Some(arg["--password=".len()..].to_string());
+                }
+                _ if arg.starts_with('-') => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("unknown option for {example}: {arg}"),
+                    ));
+                }
+                _ => positional.push(arg),
+            }
+        }
+        if let Some(port) = positional.first() {
+            out.port = parse_port(port)?;
+        }
+        if let Some(passwd) = positional.get(1) {
+            out.passwd = Some(passwd.clone());
+        }
+        Ok(out)
+    }
+}
+
+fn parse_port(value: &str) -> io::Result<u16> {
+    value
+        .parse()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "port must be a number"))
+}
+
+fn missing_value(name: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("{name} requires a value"),
+    )
+}
+
+fn print_server_help(example: &str, default_port: u16) {
+    println!(
+        "Usage: cargo run --example {example} -- [OPTIONS]\n\nOptions:\n  --host HOST        Bind host/address, e.g. 127.0.0.1 or 0.0.0.0 (default: 127.0.0.1)\n  --port PORT        Bind port (default: {default_port})\n  --passwd PASS      Enable VNC password authentication\n  --password PASS    Alias for --passwd\n  -h, --help         Show this help\n\nBackward-compatible positional form:\n  cargo run --example {example} -- [port] [password]\n"
+    );
 }
 
 fn render(pixels: &mut [u8], state: &DemoState) {

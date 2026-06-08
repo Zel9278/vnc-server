@@ -443,7 +443,9 @@ pub fn start_vnc_server(
                             if let Some(cb) = &config.client_callback {
                                 cb(VncClientEvent::Rejected {
                                     peer: Some(peer_addr),
-                                    reason: format!("failed to switch client socket to blocking: {e}"),
+                                    reason: format!(
+                                        "failed to switch client socket to blocking: {e}"
+                                    ),
                                 });
                             }
                             drop(stream);
