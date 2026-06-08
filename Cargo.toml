@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 des = "0.8"
 flate2 = "1"
+jpeg-encoder = "0.6"
 rand = "0.9"
 
 [dev-dependencies]

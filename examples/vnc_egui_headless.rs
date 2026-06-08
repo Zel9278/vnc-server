@@ -1,7 +1,7 @@
 // Headless egui + wgpu + VNC demo.
 //
 // Usage:
-//   cargo run --example vnc_egui_headless -- [--host HOST] [--port PORT] [--passwd PASS] [--low-bandwidth]
+//   cargo run --example vnc_egui_headless -- [--host HOST] [--port PORT] [--passwd PASS] [--low-bandwidth] [--jpeg-quality N]
 //
 // Then connect a VNC client to 127.0.0.1:<port>.
 
@@ -46,6 +46,10 @@ async fn run() -> io::Result<()> {
     if opts.low_bandwidth {
         config = config.with_low_bandwidth();
         println!("Low-bandwidth mode enabled: preferred pixel format is RGB565");
+    }
+    if let Some(quality) = opts.jpeg_quality {
+        config = config.with_tight_jpeg_quality(quality);
+        println!("Tight JPEG quality set to {quality}");
     }
 
     let server = start_vnc_server(Arc::clone(&frame), config)?;
@@ -96,6 +100,7 @@ struct ServerCli {
     port: u16,
     passwd: Option<String>,
     low_bandwidth: bool,
+    jpeg_quality: Option<u8>,
     help: bool,
 }
 
@@ -106,6 +111,7 @@ impl ServerCli {
             port: default_port,
             passwd: None,
             low_bandwidth: false,
+            jpeg_quality: None,
             help: false,
         };
         let mut positional = Vec::new();
@@ -114,6 +120,11 @@ impl ServerCli {
             match arg.as_str() {
                 "-h" | "--help" => out.help = true,
                 "--low-bandwidth" => out.low_bandwidth = true,
+                "--jpeg-quality" => {
+                    out.jpeg_quality = Some(parse_jpeg_quality(
+                        &args.next().ok_or_else(|| missing_value("--jpeg-quality"))?,
+                    )?);
+                }
                 "--host" => out.host = args.next().ok_or_else(|| missing_value("--host"))?,
                 "--port" => {
                     out.port = parse_port(&args.next().ok_or_else(|| missing_value("--port"))?)?;
@@ -132,6 +143,9 @@ impl ServerCli {
                 }
                 _ if arg.starts_with("--password=") => {
                     out.passwd = Some(arg["--password=".len()..].to_string());
+                }
+                _ if arg.starts_with("--jpeg-quality=") => {
+                    out.jpeg_quality = Some(parse_jpeg_quality(&arg["--jpeg-quality=".len()..])?);
                 }
                 _ if arg.starts_with('-') => {
                     return Err(io::Error::new(
@@ -158,6 +172,20 @@ fn parse_port(value: &str) -> io::Result<u16> {
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "port must be a number"))
 }
 
+fn parse_jpeg_quality(value: &str) -> io::Result<u8> {
+    let quality: u8 = value.parse().map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidInput, "jpeg quality must be a number")
+    })?;
+    if (1..=100).contains(&quality) {
+        Ok(quality)
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "jpeg quality must be between 1 and 100",
+        ))
+    }
+}
+
 fn missing_value(name: &str) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
@@ -167,7 +195,7 @@ fn missing_value(name: &str) -> io::Error {
 
 fn print_server_help(example: &str, default_port: u16) {
     println!(
-        "Usage: cargo run --example {example} -- [OPTIONS]\n\nOptions:\n  --host HOST        Bind host/address, e.g. 127.0.0.1 or 0.0.0.0 (default: 127.0.0.1)\n  --port PORT        Bind port (default: {default_port})\n  --passwd PASS      Enable VNC password authentication\n  --password PASS    Alias for --passwd\n  --low-bandwidth    Prefer 16bpp RGB565 for clients that accept it\n  -h, --help         Show this help\n\nBackward-compatible positional form:\n  cargo run --example {example} -- [port] [password]\n"
+        "Usage: cargo run --example {example} -- [OPTIONS]\n\nOptions:\n  --host HOST          Bind host/address, e.g. 127.0.0.1 or 0.0.0.0 (default: 127.0.0.1)\n  --port PORT          Bind port (default: {default_port})\n  --passwd PASS        Enable VNC password authentication\n  --password PASS      Alias for --passwd\n  --low-bandwidth      Prefer 16bpp RGB565 for clients that accept it\n  --jpeg-quality N     Tight/JPEG quality, 1..100 (default: 75)\n  -h, --help           Show this help\n\nBackward-compatible positional form:\n  cargo run --example {example} -- [port] [password]\n"
     );
 }
 

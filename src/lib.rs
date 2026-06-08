@@ -13,6 +13,7 @@ use std::time::Duration;
 use des::Des;
 use des::cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray};
 use flate2::{Compress, Compression, FlushCompress};
+use jpeg_encoder::{ColorType, Encoder as JpegEncoder};
 
 const DAMAGE_HISTORY_LIMIT: usize = 128;
 const DAMAGE_TILE_SIZE: usize = 32;
@@ -20,8 +21,13 @@ const MAX_UPDATE_RECTS: usize = 1024;
 const ENCODING_RAW: i32 = 0;
 const ENCODING_HEXTILE: i32 = 5;
 const ENCODING_ZLIB: i32 = 6;
+const ENCODING_TIGHT: i32 = 7;
 const ENCODING_ZRLE: i32 = 16;
+const ENCODING_TIGHT_QUALITY_LEVEL_0: i32 = -32;
+const ENCODING_TIGHT_QUALITY_LEVEL_9: i32 = -23;
 const HEXTILE_RAW: u8 = 1;
+const TIGHT_JPEG: u8 = 0x90;
+const TIGHT_MAX_RECT_WIDTH: u16 = 2048;
 const ZRLE_TILE_SIZE: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -262,6 +268,7 @@ pub struct VncServerConfig {
     pub auth: VncAuth,
     pub max_clients: Option<usize>,
     pub preferred_pixel_format: VncPixelFormat,
+    pub tight_jpeg_quality: u8,
 }
 
 impl VncServerConfig {
@@ -308,6 +315,11 @@ impl VncServerConfig {
         self.preferred_pixel_format = VncPixelFormat::rgb565();
         self
     }
+
+    pub fn with_tight_jpeg_quality(mut self, quality: u8) -> Self {
+        self.tight_jpeg_quality = quality.clamp(1, 100);
+        self
+    }
 }
 
 impl Default for VncServerConfig {
@@ -320,6 +332,7 @@ impl Default for VncServerConfig {
             auth: VncAuth::None,
             max_clients: None,
             preferred_pixel_format: VncPixelFormat::native(),
+            tight_jpeg_quality: 75,
         }
     }
 }
@@ -664,6 +677,7 @@ pub enum VncEncoding {
     Raw,
     Hextile,
     Zlib,
+    TightJpeg,
     Zrle,
 }
 
@@ -673,6 +687,7 @@ impl VncEncoding {
             Self::Raw => ENCODING_RAW,
             Self::Hextile => ENCODING_HEXTILE,
             Self::Zlib => ENCODING_ZLIB,
+            Self::TightJpeg => ENCODING_TIGHT,
             Self::Zrle => ENCODING_ZRLE,
         }
     }
@@ -902,6 +917,100 @@ fn encode_zrle_rect(
     encode_zlib_payload(&raw, compressor, out)
 }
 
+fn encode_tight_jpeg_rect(
+    bgra: &[u8],
+    width: usize,
+    rect: Rect,
+    quality: u8,
+    out: &mut Vec<u8>,
+) -> io::Result<()> {
+    let x = rect.x as usize;
+    let y = rect.y as usize;
+    let w = rect.width as usize;
+    let h = rect.height as usize;
+    let mut rgb = Vec::with_capacity(w * h * 3);
+    for row in y..y + h {
+        let start = (row * width + x) * 4;
+        let end = start + w * 4;
+        for px in bgra[start..end].chunks_exact(4) {
+            rgb.push(px[2]);
+            rgb.push(px[1]);
+            rgb.push(px[0]);
+        }
+    }
+
+    let mut jpeg = Vec::new();
+    JpegEncoder::new(&mut jpeg, quality)
+        .encode(&rgb, rect.width, rect.height, ColorType::Rgb)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+    out.clear();
+    out.push(TIGHT_JPEG);
+    write_tight_compact_len(jpeg.len(), out);
+    out.extend_from_slice(&jpeg);
+    Ok(())
+}
+
+fn write_tight_compact_len(mut len: usize, out: &mut Vec<u8>) {
+    let mut byte = (len & 0x7f) as u8;
+    len >>= 7;
+    if len != 0 {
+        byte |= 0x80;
+    }
+    out.push(byte);
+    if len == 0 {
+        return;
+    }
+
+    byte = (len & 0x7f) as u8;
+    len >>= 7;
+    if len != 0 {
+        byte |= 0x80;
+    }
+    out.push(byte);
+    if len != 0 {
+        out.push((len & 0xff) as u8);
+    }
+}
+
+fn requested_tight_quality(requested: &[i32]) -> Option<u8> {
+    requested
+        .iter()
+        .copied()
+        .filter(|enc| {
+            (ENCODING_TIGHT_QUALITY_LEVEL_0..=ENCODING_TIGHT_QUALITY_LEVEL_9).contains(enc)
+        })
+        .max()
+        .map(|enc| {
+            let level = enc - ENCODING_TIGHT_QUALITY_LEVEL_0;
+            (10 + level * 10).clamp(1, 100) as u8
+        })
+}
+
+fn split_tight_rects(rects: Vec<Rect>) -> Vec<Rect> {
+    let mut out = Vec::new();
+    for rect in rects {
+        if rect.width <= TIGHT_MAX_RECT_WIDTH {
+            out.push(rect);
+            continue;
+        }
+        let mut x = rect.x;
+        let mut remaining = rect.width;
+        while remaining > 0 {
+            let width = remaining.min(TIGHT_MAX_RECT_WIDTH);
+            out.push(Rect {
+                x,
+                y: rect.y,
+                width,
+                height: rect.height,
+            });
+            x = x.saturating_add(width);
+            remaining -= width;
+        }
+    }
+    out
+}
+
 fn encode_zlib_payload(raw: &[u8], compressor: &mut Compress, out: &mut Vec<u8>) -> io::Result<()> {
     let mut compressed = Vec::with_capacity(raw.len().saturating_add(1024).max(128));
     let mut offset = 0usize;
@@ -1003,10 +1112,13 @@ fn handle_vnc_client(
     let client_request = Arc::new((Mutex::new(None::<UpdateRequest>), Condvar::new()));
     let pixel_format = Arc::new(Mutex::new(config.preferred_pixel_format));
     let encoding = Arc::new(Mutex::new(VncEncoding::Raw));
+    let tight_jpeg_quality = Arc::new(Mutex::new(config.tight_jpeg_quality));
+    let configured_tight_jpeg_quality = config.tight_jpeg_quality;
     {
         let client_request = Arc::clone(&client_request);
         let pixel_format = Arc::clone(&pixel_format);
         let encoding = Arc::clone(&encoding);
+        let tight_jpeg_quality = Arc::clone(&tight_jpeg_quality);
         let input_callback = input_callback.clone();
         let reader_state = Arc::clone(&server_state);
         let mut reader = stream.try_clone()?;
@@ -1059,7 +1171,15 @@ fn handle_vnc_client(
                                     requested
                                         .push(i32::from_be_bytes([enc[0], enc[1], enc[2], enc[3]]));
                                 }
-                                let selected = if requested.contains(&ENCODING_ZRLE) {
+                                let requested_quality = requested_tight_quality(&requested);
+                                let selected = if requested.contains(&ENCODING_TIGHT)
+                                    && requested_quality.is_some()
+                                {
+                                    *tight_jpeg_quality.lock().unwrap() =
+                                        configured_tight_jpeg_quality
+                                            .min(requested_quality.unwrap());
+                                    VncEncoding::TightJpeg
+                                } else if requested.contains(&ENCODING_ZRLE) {
                                     VncEncoding::Zrle
                                 } else if requested.contains(&ENCODING_ZLIB) {
                                     VncEncoding::Zlib
@@ -1247,6 +1367,12 @@ fn handle_vnc_client(
         };
         let fmt = *pixel_format.lock().unwrap();
         let encoding = *encoding.lock().unwrap();
+        let jpeg_quality = *tight_jpeg_quality.lock().unwrap();
+        let rects = if encoding == VncEncoding::TightJpeg {
+            split_tight_rects(rects)
+        } else {
+            rects
+        };
         write_update_start(&mut stream, rects.len())?;
         for rect in rects {
             match encoding {
@@ -1262,6 +1388,9 @@ fn handle_vnc_client(
                     &mut zlib_compressor,
                     &mut encoded,
                 )?,
+                VncEncoding::TightJpeg => {
+                    encode_tight_jpeg_rect(&raw, width as usize, rect, jpeg_quality, &mut encoded)?
+                }
                 VncEncoding::Zrle => encode_zrle_rect(
                     &raw,
                     width as usize,
@@ -1522,6 +1651,53 @@ mod tests {
         )
         .unwrap();
         assert!(out.len() > 4);
+    }
+
+    #[test]
+    fn tight_jpeg_writes_control_and_compact_length() {
+        let frame = vec![0u8; 16 * 16 * 4];
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            width: 16,
+            height: 16,
+        };
+        let mut out = Vec::new();
+        encode_tight_jpeg_rect(&frame, 16, rect, 70, &mut out).unwrap();
+        assert_eq!(out[0], TIGHT_JPEG);
+        let (len, used) = read_test_tight_compact_len(&out[1..]);
+        assert_eq!(len, out.len() - 1 - used);
+        assert!(out[1 + used..].starts_with(&[0xff, 0xd8]));
+    }
+
+    #[test]
+    fn tight_rectangles_are_split_at_protocol_width_limit() {
+        let rects = split_tight_rects(vec![Rect {
+            x: 10,
+            y: 20,
+            width: 5000,
+            height: 30,
+        }]);
+        assert_eq!(rects.len(), 3);
+        assert_eq!(rects[0].width, 2048);
+        assert_eq!(rects[1].x, 2058);
+        assert_eq!(rects[1].width, 2048);
+        assert_eq!(rects[2].x, 4106);
+        assert_eq!(rects[2].width, 904);
+    }
+
+    fn read_test_tight_compact_len(bytes: &[u8]) -> (usize, usize) {
+        let b0 = bytes[0];
+        let mut len = (b0 & 0x7f) as usize;
+        if b0 & 0x80 == 0 {
+            return (len, 1);
+        }
+        let b1 = bytes[1];
+        len |= ((b1 & 0x7f) as usize) << 7;
+        if b1 & 0x80 == 0 {
+            return (len, 2);
+        }
+        (len | ((bytes[2] as usize) << 14), 3)
     }
 
     #[test]

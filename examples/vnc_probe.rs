@@ -4,6 +4,7 @@
 //   bpp = 16    -> send a RealVNC-style 16bpp 565 SetPixelFormat
 //   bpp = 32rgbx-> send a 32bpp RGBX (non-native shift) SetPixelFormat
 //   bpp = hextile -> request Hextile encoding
+//   bpp = tight   -> request Tight JPEG encoding
 //   bpp = zlib    -> request Zlib encoding
 //   bpp = zrle    -> request ZRLE encoding
 // Reads several continuous frames, checks each FramebufferUpdate stays aligned,
@@ -105,15 +106,22 @@ fn main() {
             println!("using server preferred format ({}bpp)", init[4]);
         }
     }
-    if matches!(opts.mode.as_str(), "hextile" | "zlib" | "zrle") {
+    if matches!(opts.mode.as_str(), "hextile" | "tight" | "zlib" | "zrle") {
         let preferred = match opts.mode.as_str() {
             "zrle" => 16i32,
+            "tight" => 7,
             "zlib" => 6,
             "hextile" => 5,
             _ => unreachable!(),
         };
-        let mut msg = vec![2u8, 0, 0, 3];
+        let quality = -23i32;
+        let enc_count = if opts.mode == "tight" { 4u16 } else { 3 };
+        let mut msg = vec![2u8, 0];
+        msg.extend_from_slice(&enc_count.to_be_bytes());
         msg.extend_from_slice(&preferred.to_be_bytes());
+        if opts.mode == "tight" {
+            msg.extend_from_slice(&quality.to_be_bytes());
+        }
         msg.extend_from_slice(&5i32.to_be_bytes());
         msg.extend_from_slice(&0i32.to_be_bytes());
         s.write_all(&msg).unwrap();
@@ -143,6 +151,7 @@ fn main() {
             let px = match enc {
                 5 => read_hextile_rect(&mut s, rw, rh, bytespp),
                 6 => read_zlib_rect(&mut s, rw * rh * bytespp, &mut zlib_decoder),
+                7 => read_tight_jpeg_rect(&mut s),
                 16 => read_zrle_rect(&mut s, rw, rh, bytespp, &mut zrle_decoder),
                 _ => read_exact(&mut s, rw * rh * bytespp),
             };
@@ -163,7 +172,7 @@ fn main() {
     }
 
     // Dump last frame to BMP (only meaningful for 32bpp BGRX native).
-    if bytespp == 4 && opts.mode != "zrle" {
+    if bytespp == 4 && !matches!(opts.mode.as_str(), "tight" | "zrle") {
         let path = std::env::temp_dir().join("vnc_probe.bmp");
         write_bmp(&path, &last_pixels, w as u32, h as u32);
         println!("wrote {}", path.display());
@@ -281,7 +290,7 @@ fn missing_value(name: &str) -> io::Error {
 
 fn print_probe_help() {
     println!(
-        "Usage: cargo run --example vnc_probe -- [OPTIONS]\n\nOptions:\n  --host HOST          Connect host/address (default: 127.0.0.1)\n  --port PORT          Connect port (default: 5901)\n  --bpp MODE           Pixel/encoding mode: native, 16, 32rgbx, hextile, zlib, zrle\n  --encoding MODE      Alias for --bpp\n  --passwd PASS        VNC password\n  --password PASS      Alias for --passwd\n  -h, --help           Show this help\n\nBackward-compatible positional form:\n  cargo run --example vnc_probe -- [port] [bpp] [password]\n"
+        "Usage: cargo run --example vnc_probe -- [OPTIONS]\n\nOptions:\n  --host HOST          Connect host/address (default: 127.0.0.1)\n  --port PORT          Connect port (default: 5901)\n  --bpp MODE           Pixel/encoding mode: native, 16, 32rgbx, hextile, tight, zlib, zrle\n  --encoding MODE      Alias for --bpp\n  --passwd PASS        VNC password\n  --password PASS      Alias for --passwd\n  -h, --help           Show this help\n\nBackward-compatible positional form:\n  cargo run --example vnc_probe -- [port] [bpp] [password]\n"
     );
 }
 
@@ -314,6 +323,28 @@ fn read_zlib_rect(s: &mut TcpStream, expected_len: usize, decoder: &mut Decompre
         .expect("zlib decode");
     assert_eq!(out.len(), expected_len, "unexpected zlib output length");
     out
+}
+
+fn read_tight_jpeg_rect(s: &mut TcpStream) -> Vec<u8> {
+    let control = read_exact(s, 1)[0];
+    assert_eq!(control, 0x90, "probe only supports Tight JPEG rectangles");
+    let len = read_tight_compact_len(s);
+    read_exact(s, len)
+}
+
+fn read_tight_compact_len(s: &mut TcpStream) -> usize {
+    let b0 = read_exact(s, 1)[0];
+    let mut len = (b0 & 0x7f) as usize;
+    if b0 & 0x80 == 0 {
+        return len;
+    }
+    let b1 = read_exact(s, 1)[0];
+    len |= ((b1 & 0x7f) as usize) << 7;
+    if b1 & 0x80 == 0 {
+        return len;
+    }
+    let b2 = read_exact(s, 1)[0];
+    len | ((b2 as usize) << 14)
 }
 
 fn read_zrle_rect(
