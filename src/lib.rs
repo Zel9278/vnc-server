@@ -1,15 +1,16 @@
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::{
-    Arc, Condvar, Mutex,
-};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
-use des::cipher::{generic_array::GenericArray, BlockEncrypt, KeyInit};
 use des::Des;
+use des::cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray};
 
 const DAMAGE_HISTORY_LIMIT: usize = 128;
+const ENCODING_RAW: i32 = 0;
+const ENCODING_HEXTILE: i32 = 5;
+const HEXTILE_RAW: u8 = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Rect {
@@ -61,8 +62,14 @@ impl Rect {
         }
         let x0 = self.x.min(other.x);
         let y0 = self.y.min(other.y);
-        let x1 = self.x.saturating_add(self.width).max(other.x.saturating_add(other.width));
-        let y1 = self.y.saturating_add(self.height).max(other.y.saturating_add(other.height));
+        let x1 = self
+            .x
+            .saturating_add(self.width)
+            .max(other.x.saturating_add(other.width));
+        let y1 = self
+            .y
+            .saturating_add(self.height)
+            .max(other.y.saturating_add(other.height));
         Self {
             x: x0,
             y: y0,
@@ -75,16 +82,125 @@ impl Rect {
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub enum VncInputEvent {
-    Key {
-        down: bool,
-        key: u32,
-    },
-    Pointer {
-        button_mask: u8,
-        x: u16,
-        y: u16,
-    },
+    Key { down: bool, key: u32 },
+    Pointer { button_mask: u8, x: u16, y: u16 },
     ClientCutText(Vec<u8>),
+}
+
+impl VncInputEvent {
+    pub fn pointer_position(&self) -> Option<(u16, u16)> {
+        match *self {
+            Self::Pointer { x, y, .. } => Some((x, y)),
+            _ => None,
+        }
+    }
+
+    pub fn button_mask(&self) -> Option<u8> {
+        match *self {
+            Self::Pointer { button_mask, .. } => Some(button_mask),
+            _ => None,
+        }
+    }
+
+    pub fn is_button_down(&self, button: VncMouseButton) -> bool {
+        self.button_mask()
+            .map(|mask| mask & button.mask() != 0)
+            .unwrap_or(false)
+    }
+
+    pub fn wheel_delta(&self, previous_button_mask: u8) -> i32 {
+        let Some(mask) = self.button_mask() else {
+            return 0;
+        };
+        let wheel_up = (mask & VncMouseButton::WheelUp.mask()) != 0
+            && (previous_button_mask & VncMouseButton::WheelUp.mask()) == 0;
+        let wheel_down = (mask & VncMouseButton::WheelDown.mask()) != 0
+            && (previous_button_mask & VncMouseButton::WheelDown.mask()) == 0;
+        i32::from(wheel_up) - i32::from(wheel_down)
+    }
+
+    pub fn key(&self) -> Option<VncKey> {
+        match *self {
+            Self::Key { key, .. } => Some(VncKey::from_keysym(key)),
+            _ => None,
+        }
+    }
+
+    pub fn text(&self) -> Option<char> {
+        match *self {
+            Self::Key { down: true, key } => VncKey::from_keysym(key).text(),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VncMouseButton {
+    Left,
+    Middle,
+    Right,
+    WheelUp,
+    WheelDown,
+}
+
+impl VncMouseButton {
+    pub fn mask(self) -> u8 {
+        match self {
+            Self::Left => 1 << 0,
+            Self::Middle => 1 << 1,
+            Self::Right => 1 << 2,
+            Self::WheelUp => 1 << 3,
+            Self::WheelDown => 1 << 4,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VncKey {
+    Backspace,
+    Tab,
+    Enter,
+    Escape,
+    ArrowLeft,
+    ArrowUp,
+    ArrowRight,
+    ArrowDown,
+    Shift,
+    Control,
+    Alt,
+    Meta,
+    Character(char),
+    Other(u32),
+}
+
+impl VncKey {
+    pub fn from_keysym(keysym: u32) -> Self {
+        match keysym {
+            0xff08 => Self::Backspace,
+            0xff09 => Self::Tab,
+            0xff0d | 0xff8d => Self::Enter,
+            0xff1b => Self::Escape,
+            0xff51 => Self::ArrowLeft,
+            0xff52 => Self::ArrowUp,
+            0xff53 => Self::ArrowRight,
+            0xff54 => Self::ArrowDown,
+            0xffe1 | 0xffe2 => Self::Shift,
+            0xffe3 | 0xffe4 => Self::Control,
+            0xffe7 | 0xffe8 => Self::Alt,
+            0xffeb | 0xffec => Self::Meta,
+            0x20..=0x7e => char::from_u32(keysym)
+                .map(Self::Character)
+                .unwrap_or(Self::Other(keysym)),
+            _ => Self::Other(keysym),
+        }
+    }
+
+    pub fn text(self) -> Option<char> {
+        match self {
+            Self::Character(ch) => Some(ch),
+            _ => None,
+        }
+    }
 }
 
 pub type VncInputCallback = Arc<dyn Fn(VncInputEvent) + Send + Sync + 'static>;
@@ -119,10 +235,19 @@ pub enum VncAuth {
 }
 
 impl VncAuth {
+    pub const PASSWORD_MAX_BYTES: usize = 8;
+
     fn security_type(&self) -> u8 {
         match self {
             Self::None => 1,
             Self::Password(_) => 2,
+        }
+    }
+
+    pub fn password_is_truncated(&self) -> bool {
+        match self {
+            Self::None => false,
+            Self::Password(password) => password.as_bytes().len() > Self::PASSWORD_MAX_BYTES,
         }
     }
 }
@@ -213,9 +338,7 @@ pub fn start_vnc_server(
                         let name = name.clone();
                         let config = config.clone();
                         thread::spawn(move || {
-                            if let Err(e) =
-                                handle_vnc_client(stream, frame, name, config)
-                            {
+                            if let Err(e) = handle_vnc_client(stream, frame, name, config) {
                                 println!("VNC client {peer} disconnected: {e}");
                             } else {
                                 println!("VNC client {peer} disconnected");
@@ -282,6 +405,21 @@ struct VncPixelFormat {
     r_shift: u8,
     g_shift: u8,
     b_shift: u8,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VncEncoding {
+    Raw,
+    Hextile,
+}
+
+impl VncEncoding {
+    fn wire_value(self) -> i32 {
+        match self {
+            Self::Raw => ENCODING_RAW,
+            Self::Hextile => ENCODING_HEXTILE,
+        }
+    }
 }
 
 impl VncPixelFormat {
@@ -367,6 +505,35 @@ fn encode_rect(bgra: &[u8], width: usize, rect: Rect, fmt: &VncPixelFormat, out:
     }
 }
 
+fn encode_hextile_rect(
+    bgra: &[u8],
+    width: usize,
+    rect: Rect,
+    fmt: &VncPixelFormat,
+    out: &mut Vec<u8>,
+) {
+    out.clear();
+    let x0 = rect.x as usize;
+    let y0 = rect.y as usize;
+    let x1 = x0 + rect.width as usize;
+    let y1 = y0 + rect.height as usize;
+    let mut tile_pixels = Vec::new();
+
+    for tile_y in (y0..y1).step_by(16) {
+        for tile_x in (x0..x1).step_by(16) {
+            let tile = Rect {
+                x: tile_x as u16,
+                y: tile_y as u16,
+                width: (x1 - tile_x).min(16) as u16,
+                height: (y1 - tile_y).min(16) as u16,
+            };
+            out.push(HEXTILE_RAW);
+            encode_rect(bgra, width, tile, fmt, &mut tile_pixels);
+            out.extend_from_slice(&tile_pixels);
+        }
+    }
+}
+
 fn handle_vnc_client(
     mut stream: TcpStream,
     frame: Arc<SharedFrame>,
@@ -429,18 +596,18 @@ fn handle_vnc_client(
     let mut init = Vec::with_capacity(24 + name.len());
     init.extend_from_slice(&width.to_be_bytes());
     init.extend_from_slice(&height.to_be_bytes());
-    init.extend_from_slice(&[
-        32, 24, 0, 1, 0, 255, 0, 255, 0, 255, 16, 8, 0, 0, 0, 0,
-    ]);
+    init.extend_from_slice(&[32, 24, 0, 1, 0, 255, 0, 255, 0, 255, 16, 8, 0, 0, 0, 0]);
     init.extend_from_slice(&(name.len() as u32).to_be_bytes());
     init.extend_from_slice(name.as_bytes());
     stream.write_all(&init)?;
 
     let client_request = Arc::new((Mutex::new(None::<UpdateRequest>), Condvar::new()));
     let pixel_format = Arc::new(Mutex::new(VncPixelFormat::native()));
+    let encoding = Arc::new(Mutex::new(VncEncoding::Raw));
     {
         let client_request = Arc::clone(&client_request);
         let pixel_format = Arc::clone(&pixel_format);
+        let encoding = Arc::clone(&encoding);
         let input_callback = input_callback.clone();
         let mut reader = stream.try_clone()?;
         thread::spawn(move || {
@@ -465,7 +632,11 @@ fn handle_vnc_client(
                                 parsed.r_max,
                                 parsed.g_max,
                                 parsed.b_max,
-                                if parsed.is_native() { " (native)" } else { " (converting)" },
+                                if parsed.is_native() {
+                                    " (native)"
+                                } else {
+                                    " (converting)"
+                                },
                             );
                             *pixel_format.lock().unwrap() = parsed;
                             true
@@ -477,7 +648,27 @@ fn handle_vnc_client(
                             false
                         } else {
                             let n = u16::from_be_bytes([hdr[1], hdr[2]]) as usize;
-                            read_exact_discard(&mut reader, n * 4)
+                            let mut raw = vec![0u8; n * 4];
+                            if reader.read_exact(&mut raw).is_err() {
+                                false
+                            } else {
+                                let mut requested = Vec::with_capacity(n);
+                                for enc in raw.chunks_exact(4) {
+                                    requested
+                                        .push(i32::from_be_bytes([enc[0], enc[1], enc[2], enc[3]]));
+                                }
+                                let selected = if requested.contains(&ENCODING_HEXTILE) {
+                                    VncEncoding::Hextile
+                                } else {
+                                    VncEncoding::Raw
+                                };
+                                println!(
+                                    "VNC SetEncodings: selected {:?} from {:?}",
+                                    selected, requested
+                                );
+                                *encoding.lock().unwrap() = selected;
+                                true
+                            }
                         }
                     }
                     3 => {
@@ -534,8 +725,7 @@ fn handle_vnc_client(
                         if reader.read_exact(&mut hdr).is_err() {
                             false
                         } else {
-                            let len =
-                                u32::from_be_bytes([hdr[3], hdr[4], hdr[5], hdr[6]]) as usize;
+                            let len = u32::from_be_bytes([hdr[3], hdr[4], hdr[5], hdr[6]]) as usize;
                             let mut text = vec![0u8; len];
                             if reader.read_exact(&mut text).is_err() {
                                 false
@@ -594,8 +784,14 @@ fn handle_vnc_client(
             }
         };
         let fmt = *pixel_format.lock().unwrap();
-        encode_rect(&raw, width as usize, rect, &fmt, &mut encoded);
-        write_update_header(&mut stream, rect)?;
+        let encoding = *encoding.lock().unwrap();
+        match encoding {
+            VncEncoding::Raw => encode_rect(&raw, width as usize, rect, &fmt, &mut encoded),
+            VncEncoding::Hextile => {
+                encode_hextile_rect(&raw, width as usize, rect, &fmt, &mut encoded)
+            }
+        }
+        write_update_header(&mut stream, rect, encoding)?;
         stream.write_all(&encoded)?;
     }
 }
@@ -606,14 +802,18 @@ struct UpdateRequest {
     rect: Rect,
 }
 
-fn write_update_header(stream: &mut TcpStream, rect: Rect) -> io::Result<()> {
+fn write_update_header(
+    stream: &mut TcpStream,
+    rect: Rect,
+    encoding: VncEncoding,
+) -> io::Result<()> {
     stream.write_all(&[0u8, 0u8])?;
     stream.write_all(&1u16.to_be_bytes())?;
     stream.write_all(&rect.x.to_be_bytes())?;
     stream.write_all(&rect.y.to_be_bytes())?;
     stream.write_all(&rect.width.to_be_bytes())?;
     stream.write_all(&rect.height.to_be_bytes())?;
-    stream.write_all(&0i32.to_be_bytes())
+    stream.write_all(&encoding.wire_value().to_be_bytes())
 }
 
 fn write_empty_update(stream: &mut TcpStream) -> io::Result<()> {
@@ -693,18 +893,6 @@ fn compute_damage_rect(old: &[u8], new: &[u8], width: usize, height: usize) -> O
     }
 }
 
-fn read_exact_discard<R: Read>(reader: &mut R, mut n: usize) -> bool {
-    let mut scratch = [0u8; 1024];
-    while n > 0 {
-        let chunk = n.min(scratch.len());
-        if reader.read_exact(&mut scratch[..chunk]).is_err() {
-            return false;
-        }
-        n -= chunk;
-    }
-    true
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -762,5 +950,45 @@ mod tests {
             vnc_password_response("passwore", challenge)
         );
     }
-}
 
+    #[test]
+    fn hextile_raw_tiles_include_subencoding_bytes() {
+        let frame = vec![0u8; 20 * 20 * 4];
+        let mut out = Vec::new();
+        encode_hextile_rect(
+            &frame,
+            20,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 20,
+                height: 20,
+            },
+            &VncPixelFormat::native(),
+            &mut out,
+        );
+        // 20x20 splits into 4 tiles: 16x16, 4x16, 16x4, 4x4.
+        assert_eq!(out.len(), 4 + 20 * 20 * 4);
+        assert_eq!(out[0], HEXTILE_RAW);
+        assert_eq!(out[1 + 16 * 16 * 4], HEXTILE_RAW);
+    }
+
+    #[test]
+    fn input_helpers_decode_buttons_wheel_and_text() {
+        let event = VncInputEvent::Pointer {
+            button_mask: VncMouseButton::Left.mask() | VncMouseButton::WheelUp.mask(),
+            x: 10,
+            y: 20,
+        };
+        assert_eq!(event.pointer_position(), Some((10, 20)));
+        assert!(event.is_button_down(VncMouseButton::Left));
+        assert_eq!(event.wheel_delta(VncMouseButton::Left.mask()), 1);
+
+        let key = VncInputEvent::Key {
+            down: true,
+            key: b'a' as u32,
+        };
+        assert_eq!(key.key(), Some(VncKey::Character('a')));
+        assert_eq!(key.text(), Some('a'));
+    }
+}

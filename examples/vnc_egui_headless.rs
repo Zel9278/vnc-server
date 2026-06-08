@@ -5,13 +5,12 @@
 //
 // Then connect a VNC client to 127.0.0.1:<port>.
 
-
 use std::env;
 use std::io;
-use std::sync::{mpsc, Arc};
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
-use vnc_server::{start_vnc_server, SharedFrame, VncInputEvent, VncServerConfig};
+use vnc_server::{SharedFrame, VncInputEvent, VncMouseButton, VncServerConfig, start_vnc_server};
 
 const WIDTH: u16 = 960;
 const HEIGHT: u16 = 600;
@@ -96,48 +95,48 @@ impl DemoApp {
         egui::Area::new(egui::Id::new("root"))
             .fixed_pos(egui::pos2(0.0, 0.0))
             .show(ctx, |ui| {
-        egui::Frame::default()
-            .fill(egui::Color32::from_rgb(16, 18, 22))
-            .inner_margin(egui::Margin::same(18))
-            .show(ui, |ui| {
-            ui.set_min_size(egui::vec2(WIDTH as f32 - 36.0, HEIGHT as f32 - 36.0));
-            ui.heading("Headless egui over VNC");
-            ui.label("This UI is rendered by egui/wgpu without a native window.");
-            ui.separator();
+                egui::Frame::default()
+                    .fill(egui::Color32::from_rgb(16, 18, 22))
+                    .inner_margin(egui::Margin::same(18))
+                    .show(ui, |ui| {
+                        ui.set_min_size(egui::vec2(WIDTH as f32 - 36.0, HEIGHT as f32 - 36.0));
+                        ui.heading("Headless egui over VNC");
+                        ui.label("This UI is rendered by egui/wgpu without a native window.");
+                        ui.separator();
 
-            ui.horizontal(|ui| {
-                ui.label(format!(
-                    "pointer: {:.0}, {:.0}",
-                    input.pointer_pos.x, input.pointer_pos.y
-                ));
-                ui.label(format!("buttons: 0b{:08b}", input.button_mask));
-                ui.label(format!("wheel: {}", input.wheel_ticks));
+                        ui.horizontal(|ui| {
+                            ui.label(format!(
+                                "pointer: {:.0}, {:.0}",
+                                input.pointer_pos.x, input.pointer_pos.y
+                            ));
+                            ui.label(format!("buttons: 0b{:08b}", input.button_mask));
+                            ui.label(format!("wheel: {}", input.wheel_ticks));
+                        });
+
+                        ui.horizontal(|ui| {
+                            if ui.button("Click counter").clicked() {
+                                self.clicks += 1;
+                            }
+                            ui.label(format!("clicked {count} times", count = self.clicks));
+                        });
+
+                        ui.checkbox(&mut self.check, "egui checkbox");
+                        ui.add(egui::Slider::new(&mut self.slider, 0.0..=100.0).text("slider"));
+                        ui.text_edit_singleline(&mut self.text);
+
+                        ui.separator();
+                        egui::ScrollArea::vertical()
+                            .max_height(220.0)
+                            .show(ui, |ui| {
+                                for row in 0..24 {
+                                    ui.label(format!(
+                                        "scroll row {row:02}  slider={:.1}  text='{}'",
+                                        self.slider, self.text
+                                    ));
+                                }
+                            });
+                    });
             });
-
-            ui.horizontal(|ui| {
-                if ui.button("Click counter").clicked() {
-                    self.clicks += 1;
-                }
-                ui.label(format!("clicked {count} times", count = self.clicks));
-            });
-
-            ui.checkbox(&mut self.check, "egui checkbox");
-            ui.add(egui::Slider::new(&mut self.slider, 0.0..=100.0).text("slider"));
-            ui.text_edit_singleline(&mut self.text);
-
-            ui.separator();
-            egui::ScrollArea::vertical()
-                .max_height(220.0)
-                .show(ui, |ui| {
-                    for row in 0..24 {
-                        ui.label(format!(
-                            "scroll row {row:02}  slider={:.1}  text='{}'",
-                            self.slider, self.text
-                        ));
-                    }
-                });
-            });
-        });
     }
 }
 
@@ -167,30 +166,28 @@ impl InputState {
                 self.pointer_pos = egui::pos2(x as f32, y as f32);
                 out.push(egui::Event::PointerMoved(self.pointer_pos));
 
-                for (bit, button) in [
-                    (0, egui::PointerButton::Primary),
-                    (1, egui::PointerButton::Middle),
-                    (2, egui::PointerButton::Secondary),
+                for (vnc_button, egui_button) in [
+                    (VncMouseButton::Left, egui::PointerButton::Primary),
+                    (VncMouseButton::Middle, egui::PointerButton::Middle),
+                    (VncMouseButton::Right, egui::PointerButton::Secondary),
                 ] {
-                    let was = (self.button_mask & (1 << bit)) != 0;
-                    let now = (button_mask & (1 << bit)) != 0;
+                    let was = (self.button_mask & vnc_button.mask()) != 0;
+                    let now = (button_mask & vnc_button.mask()) != 0;
                     if was != now {
                         out.push(egui::Event::PointerButton {
                             pos: self.pointer_pos,
-                            button,
+                            button: egui_button,
                             pressed: now,
                             modifiers: self.modifiers,
                         });
                     }
                 }
 
-                let wheel_up = (button_mask & (1 << 3)) != 0
-                    && (self.button_mask & (1 << 3)) == 0;
-                let wheel_down = (button_mask & (1 << 4)) != 0
-                    && (self.button_mask & (1 << 4)) == 0;
-                if wheel_up || wheel_down {
-                    let delta = if wheel_up { 72.0 } else { -72.0 };
-                    self.wheel_ticks += if wheel_up { 1 } else { -1 };
+                let wheel =
+                    VncInputEvent::Pointer { button_mask, x, y }.wheel_delta(self.button_mask);
+                if wheel != 0 {
+                    let delta = 72.0 * wheel as f32;
+                    self.wheel_ticks += wheel as i64;
                     out.push(egui::Event::MouseWheel {
                         unit: egui::MouseWheelUnit::Point,
                         delta: egui::vec2(0.0, delta),
@@ -214,8 +211,8 @@ impl InputState {
                     });
                 }
                 if down {
-                    if let Some(text) = keysym_text(key) {
-                        out.push(egui::Event::Text(text));
+                    if let Some(ch) = (VncInputEvent::Key { down, key }).text() {
+                        out.push(egui::Event::Text(ch.to_string()));
                     }
                 }
             }
@@ -291,14 +288,6 @@ fn map_key(key: u32) -> Option<egui::Key> {
         0x5a | 0x7a => egui::Key::Z,
         _ => return None,
     })
-}
-
-fn keysym_text(key: u32) -> Option<String> {
-    if (0x20..=0x7e).contains(&key) && key != 0x7f {
-        char::from_u32(key).map(|ch| ch.to_string())
-    } else {
-        None
-    }
 }
 
 struct HeadlessGpu {
@@ -468,12 +457,7 @@ struct HeadlessTarget {
 }
 
 impl HeadlessTarget {
-    fn new(
-        device: &wgpu::Device,
-        width: u32,
-        height: u32,
-        format: wgpu::TextureFormat,
-    ) -> Self {
+    fn new(device: &wgpu::Device, width: u32, height: u32, format: wgpu::TextureFormat) -> Self {
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("headless egui target"),
             size: wgpu::Extent3d {
@@ -512,4 +496,3 @@ impl HeadlessTarget {
 fn io_other(e: impl std::fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::Other, e.to_string())
 }
-

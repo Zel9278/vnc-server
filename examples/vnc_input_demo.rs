@@ -8,13 +8,12 @@
 // printed to the console. Pointer and mouse button state are also rendered into
 // the streamed framebuffer.
 
-
 use std::env;
 use std::io;
-use std::sync::{mpsc, Arc};
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
-use vnc_server::{start_vnc_server, SharedFrame, VncInputEvent, VncServerConfig};
+use vnc_server::{SharedFrame, VncInputEvent, VncMouseButton, VncServerConfig, start_vnc_server};
 
 const WIDTH: u16 = 800;
 const HEIGHT: u16 = 480;
@@ -95,31 +94,34 @@ fn main() -> io::Result<()> {
                 VncInputEvent::Pointer { button_mask, x, y } => {
                     state.pointer_x = x.min(WIDTH.saturating_sub(1));
                     state.pointer_y = y.min(HEIGHT.saturating_sub(1));
-                    let wheel_up = (button_mask & (1 << 3)) != 0
-                        && (state.button_mask & (1 << 3)) == 0;
-                    let wheel_down = (button_mask & (1 << 4)) != 0
-                        && (state.button_mask & (1 << 4)) == 0;
-                    if wheel_up {
+                    let wheel =
+                        VncInputEvent::Pointer { button_mask, x, y }.wheel_delta(state.button_mask);
+                    if wheel > 0 {
                         state.wheel_up_count += 1;
                         state.wheel_flash_until = Instant::now() + Duration::from_millis(500);
                     }
-                    if wheel_down {
+                    if wheel < 0 {
                         state.wheel_down_count += 1;
                         state.wheel_flash_until = Instant::now() + Duration::from_millis(500);
                     }
                     state.button_mask = button_mask;
                     println!(
-                        "pointer x={} y={} buttons=0b{:08b} wheel_up={} wheel_down={}",
-                        state.pointer_x, state.pointer_y, button_mask, wheel_up, wheel_down
+                        "pointer x={} y={} buttons=0b{:08b} wheel_delta={}",
+                        state.pointer_x, state.pointer_y, button_mask, wheel
                     );
                 }
-                VncInputEvent::Key { down, key } => {
+                event @ VncInputEvent::Key { down, key } => {
                     state.last_key = Some(key);
                     state.key_down = down;
-                    if down {
-                        apply_key_to_text(&mut state.typed_text, key);
+                    if let Some(ch) = event.text() {
+                        state.typed_text.push(ch);
+                    } else if down {
+                        apply_control_key_to_text(&mut state.typed_text, key);
                     }
-                    println!("key {} keysym=0x{key:08x}", if down { "down" } else { "up" });
+                    println!(
+                        "key {} keysym=0x{key:08x}",
+                        if down { "down" } else { "up" }
+                    );
                 }
                 VncInputEvent::ClientCutText(bytes) => {
                     state.cut_text_len = bytes.len();
@@ -143,7 +145,11 @@ fn render(pixels: &mut [u8], state: &DemoState) {
     draw_grid(pixels);
 
     let flash = Instant::now() < state.flash_until;
-    let panel = if flash { [46, 84, 112, 255] } else { [36, 43, 52, 255] };
+    let panel = if flash {
+        [46, 84, 112, 255]
+    } else {
+        [36, 43, 52, 255]
+    };
     fill_rect(pixels, 24, 24, 752, 122, panel);
     stroke_rect(pixels, 24, 24, 752, 122, [86, 100, 114, 255]);
 
@@ -188,15 +194,16 @@ fn render(pixels: &mut [u8], state: &DemoState) {
 
     let base_y = 220;
     let buttons = [
-        ("LEFT", 0u8),
-        ("MID", 1u8),
-        ("RIGHT", 2u8),
-        ("WHL+", 3u8),
-        ("WHL-", 4u8),
+        ("LEFT", VncMouseButton::Left),
+        ("MID", VncMouseButton::Middle),
+        ("RIGHT", VncMouseButton::Right),
+        ("WHL+", VncMouseButton::WheelUp),
+        ("WHL-", VncMouseButton::WheelDown),
     ];
-    for (idx, (label, bit)) in buttons.iter().enumerate() {
-        let active = (state.button_mask & (1 << bit)) != 0;
-        let wheel = *bit >= 3 && Instant::now() < state.wheel_flash_until;
+    for (idx, (label, button)) in buttons.iter().enumerate() {
+        let active = (state.button_mask & button.mask()) != 0;
+        let wheel = matches!(button, VncMouseButton::WheelUp | VncMouseButton::WheelDown)
+            && Instant::now() < state.wheel_flash_until;
         let x = 48 + idx as i32 * 112;
         fill_rect(
             pixels,
@@ -204,7 +211,11 @@ fn render(pixels: &mut [u8], state: &DemoState) {
             base_y,
             88,
             72,
-            if active || wheel { [53, 178, 112, 255] } else { [54, 61, 70, 255] },
+            if active || wheel {
+                [53, 178, 112, 255]
+            } else {
+                [54, 61, 70, 255]
+            },
         );
         stroke_rect(pixels, x, base_y, 88, 72, [103, 116, 130, 255]);
         draw_text(
@@ -212,7 +223,11 @@ fn render(pixels: &mut [u8], state: &DemoState) {
             x + 10,
             base_y + 26,
             label,
-            if active || wheel { [12, 24, 18, 255] } else { [204, 211, 218, 255] },
+            if active || wheel {
+                [12, 24, 18, 255]
+            } else {
+                [204, 211, 218, 255]
+            },
             2,
         );
     }
@@ -220,7 +235,10 @@ fn render(pixels: &mut [u8], state: &DemoState) {
         pixels,
         48,
         320,
-        &format!("WHEEL UP {}  DOWN {}", state.wheel_up_count, state.wheel_down_count),
+        &format!(
+            "WHEEL UP {}  DOWN {}",
+            state.wheel_up_count, state.wheel_down_count
+        ),
         [214, 222, 230, 255],
         2,
     );
@@ -228,7 +246,7 @@ fn render(pixels: &mut [u8], state: &DemoState) {
     draw_crosshair(pixels, state.pointer_x as i32, state.pointer_y as i32);
 }
 
-fn apply_key_to_text(text: &mut String, key: u32) {
+fn apply_control_key_to_text(text: &mut String, key: u32) {
     match key {
         0xff08 => {
             text.pop();
@@ -238,11 +256,6 @@ fn apply_key_to_text(text: &mut String, key: u32) {
         }
         0xff1b => {
             text.clear();
-        }
-        0x20..=0x7e => {
-            if let Some(ch) = char::from_u32(key) {
-                text.push(ch);
-            }
         }
         _ => {}
     }
@@ -388,4 +401,3 @@ fn glyph(ch: char) -> [u8; 7] {
         _ => [0x1f, 0x01, 0x02, 0x04, 0x04, 0x00, 0x04],
     }
 }
-

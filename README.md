@@ -31,7 +31,7 @@ For password authentication, use:
 let config = VncServerConfig::new().with_password("secret");
 ```
 
-VNC password authentication uses the classic VNC challenge-response scheme. Only the first 8 password bytes are used by the protocol.
+VNC password authentication uses the classic VNC challenge-response scheme. Only the first 8 password bytes are used by the protocol. You can check this with `VncAuth::password_is_truncated()`.
 
 ## Examples
 
@@ -65,6 +65,12 @@ Minimal RFB probe client for testing a running server:
 cargo run --example vnc_probe -- 5902
 ```
 
+Probe with Hextile encoding:
+
+```powershell
+cargo run --example vnc_probe -- 5902 hextile
+```
+
 Probe a password-protected server:
 
 ```powershell
@@ -75,6 +81,8 @@ cargo run --example vnc_probe -- 5902 native secret
 
 - RFB 3.8 with compatibility for 3.7/3.3 clients.
 - No TLS; bind to `127.0.0.1` unless you add an access-control layer.
-- Raw encoding only.
+- Raw and Hextile encodings.
 - Incremental requests use tracked dirty rectangles.
+- `VncInputEvent` includes helpers for pointer position, button masks, wheel deltas, and printable key text.
+
 

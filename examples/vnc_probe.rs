@@ -3,6 +3,7 @@
 //   bpp omitted -> use server's native format (no SetPixelFormat)
 //   bpp = 16    -> send a RealVNC-style 16bpp 565 SetPixelFormat
 //   bpp = 32rgbx-> send a 32bpp RGBX (non-native shift) SetPixelFormat
+//   bpp = hextile -> request Hextile encoding
 // Reads several continuous frames, checks each FramebufferUpdate stays aligned,
 // and writes the last frame to %TEMP%\vnc_probe.bmp.
 
@@ -10,8 +11,8 @@ use std::env;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 
-use des::cipher::{generic_array::GenericArray, BlockEncrypt, KeyInit};
 use des::Des;
+use des::cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray};
 
 fn read_exact(s: &mut TcpStream, n: usize) -> Vec<u8> {
     let mut buf = vec![0u8; n];
@@ -21,7 +22,11 @@ fn read_exact(s: &mut TcpStream, n: usize) -> Vec<u8> {
 
 fn main() {
     let mut args = env::args().skip(1);
-    let port: u16 = args.next().unwrap_or_else(|| "5901".into()).parse().unwrap();
+    let port: u16 = args
+        .next()
+        .unwrap_or_else(|| "5901".into())
+        .parse()
+        .unwrap();
     let mode = args.next().unwrap_or_default();
     let password = args.next();
 
@@ -36,7 +41,10 @@ fn main() {
     println!("sec count={} type={}", sec[0], sec[1]);
     let chosen = if password.is_some() { 2u8 } else { 1u8 };
     if sec[1] != chosen {
-        panic!("server offered security type {}, but probe wants {}", sec[1], chosen);
+        panic!(
+            "server offered security type {}, but probe wants {}",
+            sec[1], chosen
+        );
     }
     s.write_all(&[chosen]).unwrap();
     if chosen == 2 {
@@ -86,11 +94,18 @@ fn main() {
             println!("sent SetPixelFormat 32bpp RGBX");
             4
         }
-        _ => {
+        "hextile" | _ => {
             println!("using server native format (32bpp)");
             4
         }
     };
+    if mode == "hextile" {
+        let mut msg = vec![2u8, 0, 0, 2];
+        msg.extend_from_slice(&5i32.to_be_bytes());
+        msg.extend_from_slice(&0i32.to_be_bytes());
+        s.write_all(&msg).unwrap();
+        println!("sent SetEncodings Hextile, Raw");
+    }
 
     // One initial (non-incremental) FramebufferUpdateRequest.
     let mut req = vec![3u8, 0, 0, 0, 0, 0];
@@ -103,7 +118,10 @@ fn main() {
     for f in 0..frames {
         let hdr = read_exact(&mut s, 4);
         if hdr[0] != 0 {
-            println!("FRAME {f}: MISALIGNED! first byte = {} (expected 0)", hdr[0]);
+            println!(
+                "FRAME {f}: MISALIGNED! first byte = {} (expected 0)",
+                hdr[0]
+            );
             return;
         }
         let nrect = u16::from_be_bytes([hdr[2], hdr[3]]);
@@ -113,8 +131,12 @@ fn main() {
             let rw = u16::from_be_bytes([r[4], r[5]]) as usize;
             let rh = u16::from_be_bytes([r[6], r[7]]) as usize;
             let enc = i32::from_be_bytes([r[8], r[9], r[10], r[11]]);
-            let bytes = rw * rh * bytespp;
-            let px = read_exact(&mut s, bytes);
+            let px = if enc == 5 {
+                read_hextile_rect(&mut s, rw, rh, bytespp)
+            } else {
+                read_exact(&mut s, rw * rh * bytespp)
+            };
+            let bytes = px.len();
             total += bytes;
             let sum: u64 = px.iter().map(|&b| b as u64).sum();
             println!("FRAME {f}: rect {rw}x{rh} enc={enc} bytes={bytes} checksum={sum}");
@@ -136,6 +158,26 @@ fn main() {
         write_bmp(&path, &last_pixels, w as u32, h as u32);
         println!("wrote {}", path.display());
     }
+}
+
+fn read_hextile_rect(s: &mut TcpStream, width: usize, height: usize, bytespp: usize) -> Vec<u8> {
+    let mut pixels = vec![0u8; width * height * bytespp];
+    for tile_y in (0..height).step_by(16) {
+        for tile_x in (0..width).step_by(16) {
+            let tile_w = (width - tile_x).min(16);
+            let tile_h = (height - tile_y).min(16);
+            let subencoding = read_exact(s, 1)[0];
+            assert_eq!(subencoding & 1, 1, "probe only supports raw Hextile tiles");
+            let tile = read_exact(s, tile_w * tile_h * bytespp);
+            for row in 0..tile_h {
+                let dst = ((tile_y + row) * width + tile_x) * bytespp;
+                let src = row * tile_w * bytespp;
+                pixels[dst..dst + tile_w * bytespp]
+                    .copy_from_slice(&tile[src..src + tile_w * bytespp]);
+            }
+        }
+    }
+    pixels
 }
 
 fn vnc_password_response(password: &str, challenge: [u8; 16]) -> [u8; 16] {
